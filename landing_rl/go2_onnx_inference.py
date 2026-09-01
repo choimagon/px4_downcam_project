@@ -40,6 +40,8 @@ def terrain_hud_label(task: str, rough_level: int | None) -> str:
         return "DOWNHILL 10pct"
     if task == "rough":
         return f"ROUGH LEVEL {rough_level}"
+    if task == "gravel":
+        return "GRAVEL ROAD"
     return "FLAT"
 
 
@@ -51,7 +53,7 @@ def follow_camera(environment: Go2BackQrLandingEnv) -> mujoco.MjvCamera:
     camera = mujoco.MjvCamera()
     mujoco.mjv_defaultCamera(camera)
     camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-    if environment.terrain_task == "rough":
+    if environment.terrain_task in ("rough", "gravel"):
         # This is the wide observer used in the rough-terrain X500 inset.
         # It keeps the full airframe inside the verified viewport throughout
         # the initial search while the main view tracks the Go2 feet.
@@ -68,7 +70,7 @@ def follow_camera(environment: Go2BackQrLandingEnv) -> mujoco.MjvCamera:
     # deck.  Expand only that wide-search view so the whole airframe remains
     # safely inside frame; the 2.72 m touchdown minimum keeps the requested
     # close third-person landing view once it has approached the pad.
-    if environment.terrain_task == "rough":
+    if environment.terrain_task in ("rough", "gravel"):
         # The terrain-centred target is lower than the generic airframe target.
         # Add explicit headroom so the full X500 silhouette remains safely
         # inside the verified third-person viewport during QR search.
@@ -80,13 +82,13 @@ def follow_camera(environment: Go2BackQrLandingEnv) -> mujoco.MjvCamera:
     # Look across rough terrain rather than straight along it.  The side
     # component reveals the real hfield profile in silhouette; a forward-only
     # view projects almost all height changes into depth and reads as flat.
-    camera.azimuth = heading + (108.0 if environment.terrain_task == "rough" else 145.0)
+    camera.azimuth = heading + (108.0 if environment.terrain_task in ("rough", "gravel") else 145.0)
     # Lower oblique angle makes the diagonal foot sequence readable; the
     # distance rule above still expands automatically to keep both vehicles
     # visible from the full 2--7 m starting annulus.
     # A slightly lower side-oblique viewpoint exposes height silhouettes and
     # shadows on the rough hfield instead of making it read as a flat mat.
-    camera.elevation = -8.0 if environment.terrain_task == "rough" else -20.0
+    camera.elevation = -8.0 if environment.terrain_task in ("rough", "gravel") else -20.0
     return camera
 
 
@@ -485,6 +487,8 @@ def main() -> None:
             "offline_sim_go2_base_height_m", "offline_sim_go2_tilt_deg", "offline_sim_go2_root_wrench_max_abs",
             "offline_sim_terrain_ground_height_m", "offline_sim_terrain_rough_level",
             "offline_sim_terrain_course_inside", "offline_sim_terrain_boundary_clearance_m",
+            "offline_sim_go2_motion_ok", "offline_sim_go2_motion_window_speed_mps",
+            "offline_sim_go2_motion_violation",
             "detected", "qr_center_u", "qr_center_v", "qr_pnp_depth_m",
             "qr_center_rate_u", "qr_center_rate_v", "imu_impact_latched",
             "landing_retry_active", "landing_retry_count", "onnx_provider",
@@ -572,7 +576,7 @@ def main() -> None:
                     last_drone_box_size[1] * projection_scale,
                 ),
             )
-            if current.terrain_task == "rough":
+            if current.terrain_task in ("rough", "gravel"):
                 renderer.update_scene(current.data, camera=terrain_detail_camera(current))
                 terrain_detail = renderer.render().copy()
                 assert_render_state_unchanged(
@@ -626,6 +630,9 @@ def main() -> None:
                 int(current._active_rough_level) if current.terrain_task == "rough" else 0,
                 int(current._terrain_course_status()[0]),
                 f"{current._terrain_course_status()[1]:.6f}",
+                int(current._go2_motion_status()[0]),
+                f"{current._go2_motion_status()[1]:.6f}",
+                int(current._go2_motion_violation),
                 int(detected), f"{current._qr_center_norm[0]:.6f}", f"{current._qr_center_norm[1]:.6f}",
                 f"{current._qr_depth if detected else 0.0:.6f}", f"{current._qr_center_rate[0]:.6f}",
                 f"{current._qr_center_rate[1]:.6f}", int(imu_impact), int(retry_active),

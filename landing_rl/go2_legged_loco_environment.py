@@ -59,7 +59,13 @@ DEPLOYMENT_POLICY_ACTION_GAIN = 0.50
 # landing-scene bridge.  A 12% residual cannot counter a genuine foothold
 # disturbance, so it was the direct cause of a policy that merely followed a
 # failing open-loop trot on the old grade.
-TERRAIN_RESIDUAL_POLICY_GAIN = 0.30
+# A terrain PPO is a *small* joint-reference correction around the physical
+# trot, not an alternate whole-body controller.  Bounding the raw residual
+# makes the learned action remain useful at each footfall while preventing a
+# momentary policy spike from displacing a support foot far enough to turn the
+# robot across the finite gravel course.
+TERRAIN_RESIDUAL_POLICY_GAIN = 0.12
+TERRAIN_RESIDUAL_ACTION_LIMIT = 0.35
 # This is an IMU-only course-heading reflex.  Values around 2.4 rad/s per rad
 # over-corrected the 10% grade and eventually made the base spin; 1.2 keeps a
 # contact-driven baseline upright long enough for the PPO residual to learn
@@ -71,8 +77,13 @@ TERRAIN_YAW_RATE_DAMPING = 0.0
 # High-level route tracking uses Go2's own odometry cross-track error only;
 # it is not a terrain label and never enters the X500 policy.  It is kept
 # outside the 450-D learned residual state as a deterministic safety prior.
-TERRAIN_CROSS_TRACK_YAW_GAIN = 0.0
+TERRAIN_CROSS_TRACK_YAW_GAIN = 0.15
 TERRAIN_YAW_HIP_GAIN = 0.0
+# A small front/rear hip differential is a contact-driven steering moment.
+# It uses only Go2's own lateral odometry error and is deliberately separate
+# from the stronger yaw-rate loop so the course correction does not induce a
+# whole-body turn on compacted gravel.
+TERRAIN_CROSS_TRACK_HIP_GAIN = 0.0
 TERRAIN_GAIT_RAMP_S = 0.80
 TERRAIN_CADENCE_BASE_HZ = 2.75
 TERRAIN_CADENCE_SPEED_GAIN = 0.68
@@ -98,6 +109,12 @@ def _terrain_gait_parameters(task: str) -> tuple[float, float, float, float, flo
     base movement still comes exclusively from the four foot contacts and the
     12 joint torques.
     """
+    if task == "gravel":
+        # Embedded river stones need a planted gait.  The three task stages
+        # still differ only in forward command speed; keep the conservative
+        # reference cadence/stride so a fast command never turns a foothold
+        # perturbation into a fall before the learned residual can recover.
+        return (1.80, 0.68, 1.20, 1.80, 0.385, 0.5 * TERRAIN_FOOT_CENTER_BIAS_M)
     if task == "rough":
         return (1.80, 0.68, 1.20, 1.80, 0.385, 0.5 * TERRAIN_FOOT_CENTER_BIAS_M)
     if task == "slope_up":
@@ -261,6 +278,7 @@ def legged_loco_reference_target(
             (0.10 if leg in (0, 2) else -0.10)
             + 0.035 * lateral
             + fore_aft_sign * TERRAIN_YAW_HIP_GAIN * float(body_rpy[2] if body_rpy is not None else 0.0)
+            + fore_aft_sign * TERRAIN_CROSS_TRACK_HIP_GAIN * float(np.clip(course_lateral_error_m, -1.5, 1.5))
         )
         targets[index + 1] = thigh
         targets[index + 2] = calf
@@ -377,6 +395,15 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
             # exactly three-times faster nominal command while excluding
             # unrelated sideways/yaw random commands that would turn a
             # foothold test into a course-boundary test.
+            if self.terrain_task == "gravel":
+                # Train across the exact speed interval used by beginner,
+                # intermediate and advanced recordings.  Terrain geometry,
+                # payload and all other task conditions stay fixed.
+                # The three public replays differ *only* in speed: 0.58,
+                # 0.75 and 0.92 m/s.  Train inside that exact closed range
+                # rather than introducing a faster hidden fourth condition.
+                self._command[:] = (self.np_random.uniform(0.58, 0.92), 0.0, 0.0)
+                return
             if self.terrain_task == "rough":
                 self._command[:] = (
                     0.70 * 0.48 * TERRAIN_SPEED_MULTIPLIER,
@@ -414,7 +441,11 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
         qvel = self.data.qvel[self.dofadr]
         conditioned_action = np.asarray(action, dtype=np.float64).clip(-1.0, 1.0)
         if self.terrain_task != "flat":
-            conditioned_action = TERRAIN_RESIDUAL_POLICY_GAIN * conditioned_action
+            conditioned_action = TERRAIN_RESIDUAL_POLICY_GAIN * np.clip(
+                conditioned_action,
+                -TERRAIN_RESIDUAL_ACTION_LIMIT,
+                TERRAIN_RESIDUAL_ACTION_LIMIT,
+            )
         # Four 20 ms command steps of latency from legged-loco's DelayedPDActuatorCfg.
         if update_delay:
             self._delayed_actions.append(conditioned_action)
@@ -635,7 +666,10 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
             body_rpy[0], body_rpy[1] - terrain_initial_pitch_rad(self.terrain_task),
         ))
         course_heading_error = float(math.atan2(math.sin(body_rpy[2]), math.cos(body_rpy[2])))
-        effective_action = action * (TERRAIN_RESIDUAL_POLICY_GAIN if self.terrain_task != "flat" else 1.0)
+        effective_action = (
+            TERRAIN_RESIDUAL_POLICY_GAIN * np.clip(action, -TERRAIN_RESIDUAL_ACTION_LIMIT, TERRAIN_RESIDUAL_ACTION_LIMIT)
+            if self.terrain_task != "flat" else action
+        )
         if self.terrain_task != "flat":
             # A fall is far costlier than a momentary speed error.  This is a
             # real joint-contact task: no terrain height enters the policy,

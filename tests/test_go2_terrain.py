@@ -13,11 +13,17 @@ from landing_rl.go2_qr_environment import DRONE_OBSERVATION_NAMES, Go2BackQrLand
 from landing_rl.go2_terrain import (
     ROUGH_LEVEL_AMPLITUDE_M,
     ROUGH_HFIELD_NAME,
+    GRAVEL_HEIGHT_AMPLITUDE_M,
+    GRAVEL_HFIELD_NAME,
+    GRAVEL_LENGTH_M,
+    GRAVEL_SLOPE_GRADE,
     SLOPE_GRADE,
     SLOPE_GRADE_PERCENT,
     configure_rough_terrain,
+    gravel_rock_specs,
     terrain_course_bounds,
     terrain_edge_clearance_m,
+    terrain_geom_names,
     terrain_metadata,
     terrain_height_at,
 )
@@ -88,6 +94,40 @@ class Go2TerrainTest(unittest.TestCase):
         # catches regressions back to a single long, visually-flat swell.
         self.assertGreater(float(np.percentile(np.abs(np.diff(heights, axis=1)), 90)), 0.002)
 
+    def test_gravel_is_a_long_course_with_individual_collision_stones(self) -> None:
+        model = mujoco.MjModel.from_xml_string(build_go2_landing_xml(include_drone=False, terrain_task="gravel"))
+        terrain = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "terrain_gravel")
+        hfield = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_HFIELD, GRAVEL_HFIELD_NAME)
+        self.assertGreaterEqual(terrain, 0)
+        self.assertGreaterEqual(hfield, 0)
+        self.assertGreater(model.geom_contype[terrain], 0)
+        self.assertGreater(GRAVEL_LENGTH_M, 30.0)
+        rocks = gravel_rock_specs()
+        self.assertGreaterEqual(len(rocks), 1_500)
+        self.assertEqual(len(terrain_geom_names("gravel")), len(rocks) + 1)
+        first_band, first_index, *_ = rocks[0]
+        first_rock = mujoco.mj_name2id(
+            model, mujoco.mjtObj.mjOBJ_GEOM, f"terrain_gravel_rock_{first_band}_{first_index}"
+        )
+        self.assertGreaterEqual(first_rock, 0)
+        self.assertGreater(model.geom_contype[first_rock], 0)
+        x_samples = np.linspace(-0.6, 25.0, 241)
+        heights = np.array([terrain_height_at("gravel", float(x), 0.0) for x in x_samples])
+        # ``terrain_height_at`` deliberately returns the continuous soil base
+        # (for reset stability), not an arbitrary clast top.  It must still
+        # carry the declared gentle grade and sub-centimetre undulation.
+        self.assertGreater(float(heights.max() - heights.min()), 0.60 * GRAVEL_HEIGHT_AMPLITUDE_M)
+        self.assertAlmostEqual(
+            terrain_height_at("gravel", 25.0, 0.0) - terrain_height_at("gravel", 0.0, 0.0),
+            25.0 * GRAVEL_SLOPE_GRADE,
+            delta=0.025,
+        )
+        # The soil remains continuous between individual embedded stones: no
+        # vertical wall is allowed between adjacent 10.7 cm samples.
+        self.assertLess(float(np.max(np.abs(np.diff(heights)))), 0.050)
+        self.assertGreater(terrain_edge_clearance_m("gravel", 10.0, 0.0), 0.0)
+        self.assertLess(terrain_edge_clearance_m("gravel", 34.0, 0.0), 0.0)
+
     def test_rough_locomotion_reset_uses_selected_level(self) -> None:
         env = Go2LeggedLocoEnv(
             terrain_task="rough", rough_level=3, domain_randomization=False, sensor_noise=False, max_steps=4
@@ -127,9 +167,25 @@ class Go2TerrainTest(unittest.TestCase):
         self.assertEqual(info["offline_sim_terrain_course_breach"], 1.0)
         env.close()
 
+    def test_gravel_requires_a_moving_go2_for_landing(self) -> None:
+        env = Go2BackQrLandingEnv(terrain_task="gravel", difficulty="medium")
+        observation, info = env.reset(seed=31)
+        self.assertEqual(observation.shape, (7,))
+        self.assertEqual(info["terrain_task"], "gravel")
+        self.assertAlmostEqual(float(env._path_command(0.0)[0]), 0.75, places=6)
+        # Simulate the explicit replay gate, not a fake contact: a stopped
+        # deck must terminate without ever receiving a landing success label.
+        env._go2_motion_violation = True
+        _, _, terminated, _, step_info = env.step(np.zeros(2, dtype=np.float32))
+        self.assertTrue(terminated)
+        self.assertEqual(step_info["success"], 0.0)
+        self.assertEqual(step_info["offline_sim_go2_motion_violation"], 1.0)
+        env.close()
+
     def test_video_hud_label_is_font_safe_ascii(self) -> None:
         self.assertEqual(terrain_hud_label("slope_up", None), "UPHILL 10pct")
         self.assertEqual(terrain_hud_label("rough", 3), "ROUGH LEVEL 3")
+        self.assertEqual(terrain_hud_label("gravel", None), "GRAVEL ROAD")
 
 
 if __name__ == "__main__":

@@ -188,6 +188,64 @@ def terrain_section(report: dict) -> str:
 <p>요철 영상의 좌측 큰 화면은 Go2 발과 실제 높이장을 가까이 보는 3인칭이고, 같은 시점의 전체 X500 3인칭은 노란 테두리 삽입 화면으로 동기화해 함께 보입니다. 우측은 X500 하향 카메라입니다. 경사 상승·하강과 요철 1/2/3단계별로 PPO·DDPG·SAC를 실행했으므로 아래에 총 15개 MP4가 있습니다.</p>''' + "".join(panels) + "</section>"
 
 
+def discrete_gravel_video_panel(record: dict) -> str:
+    """Render one verified discrete-stone gravel landing card."""
+    video = html.escape(str(record.get("video", "")))
+    snapshot = html.escape(str(record.get("snapshot", "")))
+    log = html.escape(str(record.get("csv", "")))
+    receipt = html.escape(str(record.get("receipt", "")))
+    algorithm = html.escape(str(record.get("algorithm", "—")).upper())
+    korean = html.escape(str(record.get("korean_name", "—")))
+    summary = record.get("summary", {})
+    required = (record.get("video"), record.get("snapshot"), record.get("csv"), record.get("receipt"))
+    verified = all(isinstance(item, str) and (ARTIFACTS / item).exists() for item in required)
+    return f'''<section class="video-panel"><div class="video-title"><h3>{algorithm} · {korean}</h3><b class="{'ok' if verified else 'wait'}">{'완료 · 실제 돌 물리 재생' if verified else '산출물 대기'}</b></div>
+<video controls preload="metadata"><source src="{video}" type="video/mp4">MP4 재생을 지원하지 않습니다.</video>
+<a class="shot" href="{snapshot}"><img src="{snapshot}" alt="{algorithm} {korean} 실제 돌 자갈길 위 Go2와 X500 착륙"><span>좌측: Go2·X500 근접 3인칭 / 우측: X500 하향 QR / 삽입: 전체 3인칭</span></a>
+<div class="table-scroll"><table class="live"><thead><tr><th>명령 속도</th><th>QR 종단 오차</th><th>Go2 이동창 속도</th><th>Go2 경로</th><th>최대 기울기</th><th>최소 코스 여유</th><th>스키드</th><th>최대 관입</th></tr></thead><tbody><tr><td>{fmt(record.get('command_speed_mps'), 2, ' m/s')}</td><td>{fmt(summary.get('terminal_qr_error_m'), 4, ' m')}</td><td>{fmt(summary.get('terminal_motion_window_speed_mps'), 3, ' m/s')}</td><td>{fmt(summary.get('terminal_go2_path_distance_m'), 2, ' m')}</td><td>{fmt(summary.get('max_go2_tilt_deg'), 2, '°')}</td><td>{fmt(summary.get('min_terrain_boundary_clearance_m'), 3, ' m')}</td><td>{fmt(summary.get('max_skid_contacts'), 0, ' / 2')}</td><td>{fmt(float(summary.get('max_penetration_m', float('nan'))) * 1000, 3, ' mm')}</td></tr></tbody></table></div>
+<p class="offline-note">고정 시드 한 번을 사전 선언한 gate로 재생한 결과입니다. <code>Go2 낙상·코스 이탈·정지·root wrench</code>가 하나라도 발생하거나 1초 이동창 속도가 <code>0.12 m/s</code> 미만이면 성공을 금지했습니다. 표의 Go2·접촉 수치는 정책 입력이 아닌 사후 물리 검증값입니다.</p>
+<p class="links"><a href="{video}">MP4</a><a href="{snapshot}">PNG</a><a href="{log}">CSV</a><a href="{receipt}">검증 영수증</a></p></section>'''
+
+
+def gravel_landing_section(report: dict) -> str:
+    """Render the nine declared-seed moving-landing results on real rocks."""
+    demonstrations = report.get("demonstrations")
+    terrain = report.get("terrain", {})
+    if report.get("status") != "passed" or not isinstance(demonstrations, list):
+        return '''<section class="section" id="gravel-landing-suite"><h2>실제 개별 돌 자갈길 이동 착륙</h2><p>자갈길 충돌 지형과 3단계 재생 산출물을 생성 중입니다.</p></section>'''
+    panels: list[str] = []
+    for difficulty, korean in DIFFICULTIES:
+        records = [
+            item for item in demonstrations
+            if isinstance(item, dict) and item.get("difficulty") == difficulty
+        ]
+        records.sort(key=lambda item: ALGORITHMS.index(item.get("algorithm")) if item.get("algorithm") in ALGORITHMS else len(ALGORITHMS))
+        if not records:
+            continue
+        speed = fmt(records[0].get("command_speed_mps"), 2, " m/s")
+        cards = "".join(discrete_gravel_video_panel(record) for record in records)
+        panels.append(
+            f'<details class="terrain-task" open><summary>{korean} · Go2 전진 명령 {speed} · PPO/DDPG/SAC 3개</summary><div class="video-grid">{cards}</div></details>'
+        )
+    if not panels:
+        return ""
+    length = fmt(terrain.get("length_m"), 1, " m")
+    width = fmt(terrain.get("width_m"), 1, " m")
+    rocks = fmt(terrain.get("individual_collision_rocks"), 0)
+    grade = fmt(terrain.get("soil_grade_percent"), 1, "%")
+    undulation = fmt(terrain.get("soil_undulation_amplitude_mm"), 0, " mm")
+    preview = "go2_discrete_gravel_road_preview.png"
+    preview_html = (
+        f'<a class="shot" href="{preview}"><img src="{preview}" alt="개별 돌이 깔린 완만한 자갈길 렌더"><span>실제 충돌 자갈길 렌더 미리보기</span></a>'
+        if (ARTIFACTS / preview).exists() else ""
+    )
+    training_note = html.escape(str(report.get("locomotion", {}).get("training_note", "")))
+    return f'''<section class="section" id="gravel-landing-suite"><div class="section-kicker">CURRENT PHYSICAL EXPERIMENT · 9 VERIFIED MP4</div><h2>실제 개별 돌 자갈길 · 초급/중급/고급 이동 착륙</h2>
+<div class="callout"><strong>같은 자갈길·같은 드론 시작 조건에서 속도만 바꿨습니다.</strong> 초급/중급/고급 Go2 전진 명령은 각각 <strong>0.58 / 0.75 / 0.92 m/s</strong>입니다. Go2가 멈추거나 넘어지면, QR 데크·Go2 보수 외곽 중 하나라도 길 밖으로 나가면, 또는 실제 스키드 두 개가 QR 판에 닿지 않으면 그 재생은 착륙 성공으로 기록되지 않습니다.</div>
+<div class="split"><div class="formula-card"><h3>길은 실제 개별 충돌 돌입니다</h3><p>MuJoCo 물리 코스는 <strong>{length} × {width}</strong>입니다. 다져진 흙 기반에는 <strong>정적 타원체 돌 {rocks}개</strong>가 각각 독립 collision geometry로 묻혀 있고, 바닥 자체도 <strong>{grade} 완만 경사</strong>와 <strong>{undulation}</strong> 미세 기복을 가집니다. 돌·흙·QR 판·Go2 발·X500 스키드는 같은 MuJoCo 충돌계에서 계산됩니다.</p><p>이전 연속 요철 재생은 이 공개 구역에 넣지 않았습니다. 아래는 개별 돌 자갈길 결과만 표시합니다.</p>{preview_html}</div><div class="formula-card"><h3>착륙을 막는 사전 선언 gate</h3><p>각 PPO/DDPG/SAC 영상은 난이도별로 한 개의 고정 시드만 사용했습니다. <strong>낙상 0</strong>, <strong>코스 이탈 0</strong>, <strong>Go2 root 외력 0</strong>, <strong>최대 기울기 ≤ 35°</strong>, <strong>스키드 2/2</strong>, <strong>수치 관입 ≤ 2.1 mm</strong>, 그리고 착륙 직전 1초 이동창 <strong>≥ 0.12 m/s</strong>를 모두 검사합니다. 따라서 Go2가 멈췄을 때의 착륙은 통과할 수 없습니다.</p><p>{training_note}</p></div></div>
+<p>모든 MP4는 동일 MuJoCo state에서 좌측 근접 3인칭, 우측 X500 하향 QR, 삽입 전체 3인칭을 동기화해 캡처했습니다. 프로펠러는 영상에서 회전하며, X500·Go2·QR 판이 동시에 화면에 보이도록 카메라를 배치했습니다.</p>{''.join(panels)}</section>'''
+
+
 def algorithm_card(name: str, metrics: dict, onnx: dict) -> str:
     policy = metrics.get("metrics", {}).get(name, {})
     held_out = policy.get("held_out", {})
@@ -211,7 +269,7 @@ def main() -> None:
     timesteps = html.escape(str(metrics.get("timesteps_per_algorithm", "—")))
     source = html.escape(str(metrics.get("go2_model_source", "unitreerobotics/unitree_mujoco")))
     cards = "".join(algorithm_card(name, metrics, onnx_models.get(name, {})) for name in ALGORITHMS)
-    terrain_html = terrain_section(read_json(ARTIFACTS / "go2_terrain_landing_suite.json"))
+    gravel_html = gravel_landing_section(read_json(ARTIFACTS / "go2_discrete_gravel_landing_suite.json"))
     loco_eval = loco.get("evaluation", {})
     loco_error = fmt(loco_eval.get("mean_terminal_velocity_error_mps"), 3, " m/s")
     loco_yaw_error = fmt(loco_eval.get("mean_terminal_yaw_rate_error_radps"), 3, " rad/s")
@@ -375,8 +433,8 @@ def main() -> None:
 <section class="section"><h2>초급·중급·고급의 정의: Go2 속도와 방향전환 복잡도</h2><div class="split"><div class="formula-card"><h3>동일 조건, 경로만 난이도화</h3><p>세 난이도 모두 X500 시작점은 QR 중심에서 2–7 m 원환 영역, 고도 1.20–1.80 m이며 바람·검출 누락·착륙 판정도 같습니다. 달라지는 것은 Go2의 명목 전진속도와 선회 진폭·빈도뿐입니다. Go2는 경로 접선 방향으로 몸통 yaw를 돌리고 대각선 트로트로 이동합니다.</p><details><summary>Go2 경로 생성 수식 펼쳐 보기</summary>{route_formula}</details></div><div class="formula-card"><h3>실행 프로파일</h3><div class="table-scroll"><table><thead><tr><th>난이도</th><th>명목 전진</th><th>최대 선회각</th><th>전환 빈도</th></tr></thead><tbody>{difficulty_rows}</tbody></table></div><p>Go2는 각 난이도에 정의된 시간 함수 속도·선회 명령을 그대로 따르며, 드론의 정렬 또는 착륙 상태로 경로 속도를 바꾸지 않습니다.</p></div></div></section>
 <section class="section"><h2><code>offline_sim_*</code> X500 착륙다리 바닥 ↔ QR 판 물리 진단</h2><div class="callout"><strong>착륙다리 센서가 아닙니다.</strong> 아래 레일 접촉·정상력·침투량·데크 속도는 MuJoCo 학습 보상, 종단 판정, 사후 검증에만 쓰이고 7D 정책 관측에는 들어가지 않습니다.</div><div class="split"><div class="formula-card"><h3>무엇을 검사하나</h3><p>MuJoCo contact 목록에서 PX4 Gazebo 원본과 같은 좌·우 스키드 레일 물체와 QR 판 최상면 사이의 접촉만 골라, 닿은 레일 수·정상력 합·가장 깊은 수치 침투를 계산합니다. QR 잉크는 이 면보다 3 μm 위의 렌더 레이어라 하향 카메라에서 깜박이지 않으며 물리 접촉에는 쓰이지 않습니다. 이 값은 실제 X500에서 얻는 센서값이 아니며 영상 성공 여부와 물리 형상 비관통을 사후 확인하기 위한 것입니다.</p><details><summary>접촉 진단 수식 펼쳐 보기</summary>{contact_formula}</details></div><div class="formula-card"><h3>보정 기준</h3><p><code>보이는 물리 착륙 스키드 레일 2개</code>는 각각 길이 250 mm·폭 15 mm·높이 15 mm이고 body 기준 <code>x=0, y=±0.132 m</code>, 바닥면 <code>z=-0.22759951 m</code>입니다. 수입한 stock X500 렌더 스키드의 최저면과 36 cm 물리 QR 데크 최상면을 일치시켜, 사용자가 보는 다리 바닥 물체가 곧 접촉 물체가 되게 했습니다. QR 잉크 3 μm는 실제 인쇄 두께 수준의 시각 분리입니다. 성공은 양쪽 레일 모두 접촉, 상대높이 0.245 m 이하, 중심오차 5.5 cm, 데크 대비 상대속도 0.40 m/s 미만을 동시에 만족해야 합니다.</p><p>MuJoCo soft-contact의 수치 침투 gate는 2 mm이며, 보이는 충돌 레일과 보이는 QR 물리 판이 직접 맞닿으므로 수치 침투와 영상 형상이 서로 어긋나지 않습니다. 각 추론 CSV의 <code>offline_sim_visual_contact_plane_error_m</code>도 1 mm 이하인지 검사합니다. 표와 CSV에는 실제 최대값을 숨기지 않고 <code>offline_sim_*</code>로 기록합니다.</p></div></div></section>
 <section class="section"><h2>PPO · DDPG · SAC 학습방법과 하이퍼파라미터</h2><div class="callout">세 기법은 위에서 설명한 <strong>동일한 float32[7] 입력, 2D residual 출력, 환경 보상</strong>을 사용합니다. 차이는 경험을 모으고 actor/critic을 갱신하는 방식입니다.</div><div class="example-grid"><article><h3>PPO</h3><p>현재 정책으로 512 step rollout을 모은 뒤, advantage가 좋은 행동 확률은 올리고 나쁜 행동 확률은 내립니다. 한 번의 큰 업데이트로 정책이 무너지는 것을 막기 위해 이전 정책과의 확률비를 ±20% 범위로 clip하며 같은 rollout을 10 epoch 재사용합니다.</p><p><code>lr 2.5e-4 · batch 128 · γ 0.997 · GAE 0.96 · clip 0.20 · value coefficient 0.50</code></p></article><article><h3>DDPG</h3><p>결정론 actor가 한 행동을 critic이 평가합니다. 180,000개 replay buffer에서 과거 transition을 무작위로 뽑아 Q 오차를 줄이고, actor는 critic의 Q가 커지는 방향으로 갱신합니다. 처음 2,000 step은 buffer를 채우며, 학습 탐색에는 표준편차 0.18 행동 잡음을 사용합니다.</p><p><code>lr 3e-4 · batch 256 · γ 0.997 · target τ 0.01 · warm-up 2,000</code></p></article><article><h3>SAC</h3><p>두 Q critic 중 작은 값을 사용해 과대평가를 줄입니다. actor는 높은 Q뿐 아니라 행동 분포의 entropy도 유지하도록 학습해, DDPG보다 확률적인 탐색을 합니다. entropy 계수는 초기값 0.02에서 자동 조정됩니다.</p><p><code>lr 3e-4 · replay 180,000 · batch 256 · γ 0.997 · target τ 0.01 · warm-up 2,000</code></p></article><article><h3>공통 데이터 한 건</h3><p>각 transition은 <code>(현재 7D, 2D 행동, reward, 다음 7D, 종료 여부)</code>입니다. 보상과 종료 판정에는 MuJoCo 정답 라벨을 쓸 수 있지만, 저장된 actor가 받는 입력은 계속 7D뿐입니다. 평가와 영상에서는 학습 탐색 잡음을 끄고 결정론적으로 ONNX 출력을 사용합니다.</p></article></div><details><summary>PPO·DDPG·SAC 손실 수식 펼쳐 보기</summary>{loss_formula}</details><p>수식은 CDN이 아닌 이 서버의 로컬 MathJax로 렌더링됩니다.</p></section>
-<section class="section"><h2>초급·중급·고급: 9개 동기화 영상과 평가</h2><p>각 MP4는 5 ms 물리 서브스텝에서 실제 30 fps로 캡처하며, 좌측 Go2·X500 3인칭과 우측 X500 하향 카메라를 같은 MuJoCo state에서 렌더링합니다. 요철 영상은 Go2 지형 근접 주 화면에 전체 X500 3인칭 삽입 화면을 동기화해, 지형·드론·하향 카메라를 동시에 보여 줍니다. 우측 하단뷰는 검정 레터박스 없이 640×720 전체 높이를 채웁니다. 넓은 3인칭의 X500은 매 프레임 현재 GL 카메라로 투영하고, 1 Hz MuJoCo segmentation 실루엣으로 실제 렌더 가시성과 크기를 반복 검증합니다. 프로펠러는 영상에서만 반대 방향으로 회전하며, Go2와 QR 장착부의 물리에는 영향을 주지 않습니다.</p>{cards}</section>
-{terrain_html}
+<section class="section"><h2>초급·중급·고급: 9개 동기화 영상과 평가</h2><p>각 MP4는 5 ms 물리 서브스텝에서 실제 30 fps로 캡처하며, 좌측 Go2·X500 3인칭과 우측 X500 하향 카메라를 같은 MuJoCo state에서 렌더링합니다. 자갈길 영상은 Go2 발이 닿는 실제 충돌면을 가까이 보는 3인칭 주 화면에, 전체 X500 3인칭 삽입 화면을 같은 시점으로 동기화합니다. 우측 하단뷰는 검정 레터박스 없이 640×720 전체 높이를 채웁니다. 넓은 3인칭의 X500은 매 프레임 현재 GL 카메라로 투영하고, 1 Hz MuJoCo segmentation 실루엣으로 실제 렌더 가시성과 크기를 반복 검증합니다. 프로펠러는 영상에서만 반대 방향으로 회전하며, Go2와 QR 장착부의 물리에는 영향을 주지 않습니다.</p>{cards}</section>
+{gravel_html}
 <footer>6개 핵심 평가지표: <code>mean_reward</code>, <code>std_reward</code>, <code>success_rate</code>, <code>mean_terminal_error_m</code>, <code>mean_episode_duration_s</code>, <code>mean_episode_steps</code>. 접촉·데크 속도·Go2 물리량은 정책 입력이 아닌 <code>offline_sim_*</code> 진단입니다. 모든 산출물은 MuJoCo에서 생성했습니다.</footer></main></body></html>'''
     output = ARTIFACTS / "go2_back_qr_landing_dashboard.html"
     output.write_text(document, encoding="utf-8")

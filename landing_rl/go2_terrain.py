@@ -9,13 +9,14 @@ same slope/rough surface that is visible in the landing recordings.
 from __future__ import annotations
 
 import math
+from functools import lru_cache
 from typing import Final
 
 import mujoco
 import numpy as np
 
 
-TERRAIN_TASKS: Final = ("flat", "slope_up", "slope_down", "rough")
+TERRAIN_TASKS: Final = ("flat", "slope_up", "slope_down", "rough", "gravel")
 TERRAIN_SCENARIOS: Final = (
     ("slope_up", None),
     ("slope_down", None),
@@ -59,6 +60,33 @@ ROUGH_HFIELD_GEOM_NAME: Final = "terrain_rough"
 # box walls that a Go2 foot cannot physically traverse.
 ROUGH_HFIELD_SAMPLES_X: Final = 161
 ROUGH_HFIELD_SAMPLES_Y: Final = 25
+
+# The approved road is a finite rural gravel track: individual rounded stones
+# are embedded into a gently undulating compacted-soil heightfield.  Stones
+# are real static MuJoCo collision geoms, not a camera texture.  The soil base
+# keeps the road physically continuous between stones so a foot cannot drop
+# through a sparse visual gap.
+GRAVEL_START_X_M: Final = -0.80
+GRAVEL_LENGTH_M: Final = 34.0
+GRAVEL_HALF_WIDTH_M: Final = 2.35
+GRAVEL_BASE_HEIGHT_M: Final = 0.090
+GRAVEL_SLOPE_GRADE: Final = 0.008
+GRAVEL_HEIGHT_AMPLITUDE_M: Final = 0.010
+GRAVEL_HFIELD_HALF_THICKNESS_M: Final = 0.18
+GRAVEL_HFIELD_NAME: Final = "terrain_gravel_hfield"
+GRAVEL_HFIELD_GEOM_NAME: Final = "terrain_gravel"
+GRAVEL_HFIELD_SAMPLES_X: Final = 341
+GRAVEL_HFIELD_SAMPLES_Y: Final = 49
+GRAVEL_ROCK_SEED: Final = 20260901
+# Count is deliberately high enough for a visibly dense river-gravel track,
+# but bounded so the same real collision model remains practical to train in
+# CPU MuJoCo.  All entries are static individual ellipsoids.
+GRAVEL_ROCK_BANDS: Final = (
+    (1_000, 0.021, 0.050),
+    (450, 0.047, 0.082),
+    (100, 0.078, 0.128),
+)
+GRAVEL_ROCK_START_BUFFER_M: Final = 0.90
 TERRAIN_SPEED_MULTIPLIER: Final = 3.0
 TERRAIN_ROUTE_TARGET_X_M: Final = 12.0
 
@@ -96,6 +124,13 @@ def terrain_course_bounds(task: str) -> tuple[float, float, float, float] | None
             ROUGH_START_Y_M,
             ROUGH_START_Y_M + ROUGH_TILE_COUNT_Y * ROUGH_TILE_WIDTH_M,
         )
+    if task == "gravel":
+        return (
+            GRAVEL_START_X_M,
+            GRAVEL_START_X_M + GRAVEL_LENGTH_M,
+            -GRAVEL_HALF_WIDTH_M,
+            GRAVEL_HALF_WIDTH_M,
+        )
     return None
 
 
@@ -120,6 +155,8 @@ def terrain_display_name(task: str, level: int | None = None) -> str:
         return f"경사 하강 ({SLOPE_GRADE_PERCENT:g}% · {SLOPE_ANGLE_DEG:.2f}°)"
     if task == "rough":
         return f"울퉁불퉁 지형 {validate_rough_level(level)}단계"
+    if task == "gravel":
+        return "자갈길 이동 착륙"
     return "평지"
 
 
@@ -180,6 +217,83 @@ def _rough_indices(x_m: float, y_m: float) -> tuple[int, int]:
     return index_x, index_y
 
 
+def _gravel_base_height_at(x_m: float, y_m: float) -> float:
+    """Return the continuous, gently sloped soil height below the stones."""
+    progress = float(np.clip((x_m - GRAVEL_START_X_M) / GRAVEL_LENGTH_M, 0.0, 1.0))
+    return float(
+        GRAVEL_BASE_HEIGHT_M
+        + GRAVEL_SLOPE_GRADE * max(0.0, x_m - GRAVEL_START_X_M)
+        + GRAVEL_HEIGHT_AMPLITUDE_M * math.sin(2.0 * math.pi * progress * 2.1)
+        + 0.004 * math.sin(2.0 * math.pi * progress * 6.0 + 1.1)
+        + 0.002 * math.cos(2.0 * math.pi * y_m / (2.0 * GRAVEL_HALF_WIDTH_M))
+    )
+
+
+@lru_cache(maxsize=1)
+def gravel_rock_specs() -> tuple[tuple[int, int, float, float, float, float, float, float, float, int], ...]:
+    """Return deterministic individual static-rock specs for the real track.
+
+    ``band, index, x, y, sx, sy, sz, roll, pitch, colour``.  The initial
+    Go2 stance rectangle is intentionally clear, after which each foot enters
+    the same dense physical stones seen in the recording.
+    """
+    rng = np.random.default_rng(GRAVEL_ROCK_SEED)
+    specs: list[tuple[int, int, float, float, float, float, float, float, float, int]] = []
+    occupied: list[tuple[float, float, float]] = []
+    for band, (count, minimum, maximum) in enumerate(GRAVEL_ROCK_BANDS):
+        added = 0
+        attempts = 0
+        while added < count:
+            attempts += 1
+            if attempts > count * 20:
+                raise RuntimeError("could not place deterministic gravel rocks")
+            x_m = float(rng.uniform(GRAVEL_START_X_M, GRAVEL_START_X_M + GRAVEL_LENGTH_M))
+            y_m = float(rng.uniform(-GRAVEL_HALF_WIDTH_M + 0.04, GRAVEL_HALF_WIDTH_M - 0.04))
+            # Keep reset contact deterministic; the cleared patch is not a
+            # bypass because the Go2 walks into rocks within its first stride.
+            if x_m < GRAVEL_START_X_M + GRAVEL_ROCK_START_BUFFER_M and abs(y_m) < 0.58:
+                continue
+            sx = float(rng.uniform(minimum, maximum))
+            sy = sx * float(rng.uniform(0.62, 1.05))
+            radius = max(sx, sy)
+            # Do not stack static stones through each other.  Overlap would
+            # render like a natural pile but creates accidental 60+ mm spikes
+            # that contradict the approved gentle, walkable road profile.
+            if any(math.hypot(x_m - px, y_m - py) < 0.82 * (radius + pr) for px, py, pr in occupied):
+                continue
+            # Reference-track river stones are broad and embedded in soil.
+            # Limit exposed height to roughly 7--32 mm; their full lateral
+            # extent is still visible and collidable, but no isolated rock
+            # becomes a leg-catching boulder on the deliberately gentle road.
+            sz = sx * float(rng.uniform(0.18, 0.32))
+            roll = float(rng.uniform(-0.30, 0.30))
+            pitch = float(rng.uniform(-0.26, 0.26))
+            specs.append((band, added, x_m, y_m, sx, sy, sz, roll, pitch, int(rng.integers(0, 6))))
+            occupied.append((x_m, y_m, radius))
+            added += 1
+    return tuple(specs)
+
+
+@lru_cache(maxsize=1)
+def _gravel_hfield_samples() -> tuple[float, float, str]:
+    """Return soil-height range and normalized MuJoCo hfield samples."""
+    heights = np.array(
+        [
+            _gravel_base_height_at(
+                GRAVEL_START_X_M + GRAVEL_LENGTH_M * column / (GRAVEL_HFIELD_SAMPLES_X - 1),
+                -GRAVEL_HALF_WIDTH_M + 2.0 * GRAVEL_HALF_WIDTH_M * row / (GRAVEL_HFIELD_SAMPLES_Y - 1),
+            )
+            for row in range(GRAVEL_HFIELD_SAMPLES_Y)
+            for column in range(GRAVEL_HFIELD_SAMPLES_X)
+        ],
+        dtype=np.float64,
+    )
+    lower = float(heights.min())
+    upper = float(heights.max())
+    elevation = " ".join(f"{value:.7f}" for value in (heights - lower) / (upper - lower))
+    return lower, upper, elevation
+
+
 def terrain_height_at(task: str, x_m: float, y_m: float, *, rough_level: int | None = None) -> float:
     """Top contact height below ``(x, y)`` for reset and diagnostics."""
     validate_terrain_task(task)
@@ -189,6 +303,13 @@ def terrain_height_at(task: str, x_m: float, y_m: float, *, rough_level: int | N
         return float(np.clip((x_m - SLOPE_START_X_M) * math.tan(SLOPE_ANGLE_RAD), 0.0, SLOPE_LENGTH_M * math.tan(SLOPE_ANGLE_RAD)))
     if task == "slope_down":
         return float(np.clip((SLOPE_START_X_M + SLOPE_LENGTH_M - x_m) * math.tan(SLOPE_ANGLE_RAD), 0.0, SLOPE_LENGTH_M * math.tan(SLOPE_ANGLE_RAD)))
+    if task == "gravel":
+        if not (
+            GRAVEL_START_X_M <= x_m <= GRAVEL_START_X_M + GRAVEL_LENGTH_M
+            and -GRAVEL_HALF_WIDTH_M <= y_m <= GRAVEL_HALF_WIDTH_M
+        ):
+            return 0.0
+        return _gravel_base_height_at(x_m, y_m)
     level = validate_rough_level(rough_level)
     if not (
         ROUGH_START_X_M <= x_m <= ROUGH_START_X_M + ROUGH_TILE_COUNT_X * ROUGH_TILE_LENGTH_M
@@ -201,8 +322,21 @@ def terrain_height_at(task: str, x_m: float, y_m: float, *, rough_level: int | N
 def terrain_asset_xml(task: str) -> str:
     """Return MuJoCo assets required by a terrain task."""
     validate_terrain_task(task)
-    if task != "rough":
+    if task not in ("rough", "gravel"):
         return ""
+    if task == "gravel":
+        lower, upper, elevation = _gravel_hfield_samples()
+        return (
+            '<texture name="gravel_terrain_texture" type="2d" builtin="flat" mark="random" '
+            'rgb1=".31 .30 .27" markrgb=".15 .15 .13" random=".22" width="512" height="512"/>'
+            '<material name="gravel_terrain_material" texture="gravel_terrain_texture" '
+            'texrepeat="12 4" texuniform="true" reflectance=".05" specular=".06" shininess=".16"/>'
+            f'<hfield name="{GRAVEL_HFIELD_NAME}" nrow="{GRAVEL_HFIELD_SAMPLES_Y}" '
+            f'ncol="{GRAVEL_HFIELD_SAMPLES_X}" '
+            f'size="{0.5 * GRAVEL_LENGTH_M:.6f} {GRAVEL_HALF_WIDTH_M:.6f} '
+            f'{upper - lower:.6f} {GRAVEL_HFIELD_HALF_THICKNESS_M:.6f}" '
+            f'elevation="{elevation}"/>'
+        )
     elevation = " ".join(
         f"{0.5 + 0.5 * _rough_pattern(index_x * (ROUGH_TILE_COUNT_X - 1) / (ROUGH_HFIELD_SAMPLES_X - 1), index_y * (ROUGH_TILE_COUNT_Y - 1) / (ROUGH_HFIELD_SAMPLES_Y - 1)):.7f}"
         for index_y in range(ROUGH_HFIELD_SAMPLES_Y)
@@ -245,6 +379,27 @@ def terrain_xml(task: str) -> str:
             f'size="{0.5 * SLOPE_LENGTH_M:.4f} {SLOPE_HALF_WIDTH_M:.4f} {SLOPE_HALF_THICKNESS_M:.4f}" '
             f'rgba="{colour}" friction="1.10 .020 .010" condim="3" contype="1" conaffinity="1"/>'
         )
+    if task == "gravel":
+        center_x = GRAVEL_START_X_M + 0.5 * GRAVEL_LENGTH_M
+        lower, _, _ = _gravel_hfield_samples()
+        base = (
+            f'<geom name="{GRAVEL_HFIELD_GEOM_NAME}" type="hfield" hfield="{GRAVEL_HFIELD_NAME}" '
+            f'pos="{center_x:.6f} 0 {lower:.6f}" '
+            f'material="gravel_terrain_material" rgba=".70 .70 .67 1" '
+            f'friction="1.08 .020 .010" condim="3" contype="1" conaffinity="1"/>'
+        )
+        colors = (".22 .22 .20 1", ".31 .30 .27 1", ".40 .37 .31 1", ".20 .24 .24 1", ".47 .43 .36 1", ".28 .27 .24 1")
+        rocks: list[str] = []
+        for band, index, x_m, y_m, sx, sy, sz, roll, pitch, color_index in gravel_rock_specs():
+            yaw = ((band * 0.71 + index * 2.399963229728653) % (2.0 * math.pi)) - math.pi
+            z_m = _gravel_base_height_at(x_m, y_m) - 0.006 + 0.56 * sz
+            rocks.append(
+                f'<geom name="terrain_gravel_rock_{band}_{index}" type="ellipsoid" '
+                f'pos="{x_m:.5f} {y_m:.5f} {z_m:.5f}" euler="{roll:.5f} {pitch:.5f} {yaw:.5f}" '
+                f'size="{sx:.5f} {sy:.5f} {sz:.5f}" rgba="{colors[color_index]}" '
+                'friction="1.15 .018 .008" condim="3" contype="1" conaffinity="1"/>'
+            )
+        return base + "\n" + "\n".join(rocks)
     center_x = ROUGH_START_X_M + 0.5 * ROUGH_TILE_COUNT_X * ROUGH_TILE_LENGTH_M
     center_y = ROUGH_START_Y_M + 0.5 * ROUGH_TILE_COUNT_Y * ROUGH_TILE_WIDTH_M
     # hfield elevation is normalized.  Its world Z origin is the requested
@@ -263,6 +418,11 @@ def terrain_geom_names(task: str) -> tuple[str, ...]:
         return (f"terrain_{task}",)
     if task == "rough":
         return (ROUGH_HFIELD_GEOM_NAME,)
+    if task == "gravel":
+        return (
+            GRAVEL_HFIELD_GEOM_NAME,
+            *(f"terrain_gravel_rock_{band}_{index}" for band, index, *_ in gravel_rock_specs()),
+        )
     return ()
 
 
@@ -317,5 +477,16 @@ def terrain_metadata(task: str, level: int | None = None) -> dict[str, float | i
             "height_amplitude_mm": int(round(1000.0 * ROUGH_LEVEL_AMPLITUDE_M[level])),
             "tile_size_m": ROUGH_TILE_LENGTH_M,
             "surface_friction": 1.10,
+        }
+    if task == "gravel":
+        return {
+            "task": "gravel",
+            "display_name": terrain_display_name("gravel"),
+            "length_m": GRAVEL_LENGTH_M,
+            "width_m": 2.0 * GRAVEL_HALF_WIDTH_M,
+            "soil_grade_percent": 100.0 * GRAVEL_SLOPE_GRADE,
+            "soil_undulation_amplitude_mm": int(round(1000.0 * GRAVEL_HEIGHT_AMPLITUDE_M)),
+            "individual_collision_rocks": len(gravel_rock_specs()),
+            "surface_friction": 1.08,
         }
     return {"task": "flat", "display_name": "평지", "surface_friction": 0.75}

@@ -10,6 +10,7 @@ replace that low-level joint residual at inference time.
 from __future__ import annotations
 
 import math
+from collections import deque
 from pathlib import Path
 from typing import Any, Callable
 
@@ -48,6 +49,16 @@ GO2_STAND_POSE[0::3] = np.array([0.10, -0.10, 0.10, -0.10], dtype=np.float64)
 # rectangular bound.  The plate's exact collision radius is read from MuJoCo.
 GO2_TERRAIN_BODY_RADIUS_M = 0.30
 TERRAIN_BOUNDARY_STOP_BUFFER_M = 0.90
+# Gravel difficulty changes only Go2's forward speed.  Start radius, altitude,
+# wind, QR detector and touchdown tolerances remain the common comparison
+# contract, so easy/medium/hard are not secretly different landing tasks.
+GRAVEL_ROUTE_SPEED_MPS = {"train": 0.75, "easy": 0.58, "medium": 0.75, "hard": 0.92}
+GRAVEL_MOTION_GUARD_START_S = 2.0
+GRAVEL_MOTION_WINDOW_S = 1.0
+# A one-second mean below 0.12 m/s is a genuine halt for this task; normal
+# early terrain recovery can dip below the commanded velocity while still
+# walking continuously through a rounded clast.
+GRAVEL_MIN_WINDOW_SPEED_MPS = 0.12
 
 # This tuple is the auditable policy-input contract.  Every element is
 # available from the stock X500/PX4 stack: a QR detector/PnP pipeline on the
@@ -159,7 +170,7 @@ def _landing_contact_xml(terrain_task: str) -> str:
     # board.  A 10% moving plane instead needs the original compliant pair so
     # both continuous rails can settle together rather than rebound on a
     # single downhill edge.
-    if terrain_task == "rough":
+    if terrain_task in ("rough", "gravel"):
         return 'solref="-100000 -100" solimp=".99 .999 .0001"'
     return 'solref=".008 1" solimp=".96 .99 .001"'
 
@@ -495,6 +506,8 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self._landing_retry_active = False
         self._landing_retry_count = 0
         self._path_length = 0.0
+        self._go2_motion_samples: deque[tuple[float, float]] = deque()
+        self._go2_motion_violation = False
         self._previous_base_position = np.zeros(3, dtype=np.float64)
         self._previous_go2_foot_positions = np.zeros((4, 3), dtype=np.float64)
         self._previous_go2_contact_mask = np.zeros(4, dtype=bool)
@@ -505,15 +518,20 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self._legged_loco = None
         if locomotion_model is not None:
             from .go2_legged_loco_adapter import Go2LeggedLocoAdapter
+            from .go2_legged_loco_environment import TERRAIN_RESIDUAL_ACTION_LIMIT, TERRAIN_RESIDUAL_POLICY_GAIN
 
             # Terrain residuals are scaled exactly once in
             # _apply_go2_locomotion(), matching Go2LeggedLocoEnv.  The bridge
             # therefore forwards the policy output unchanged; applying 25%
             # here as well would silently reduce the trained authority to
             # 6.25% in the recorded physical scene.
-            terrain_deployment_gain = 1.0 if self.terrain_task != "flat" else 0.50
+            terrain_mode = self.terrain_task != "flat"
+            terrain_deployment_gain = 1.0 if terrain_mode else 0.50
             self._legged_loco = Go2LeggedLocoAdapter(
-                locomotion_model, deployment_action_gain=terrain_deployment_gain
+                locomotion_model,
+                deployment_action_gain=terrain_deployment_gain,
+                action_limit=TERRAIN_RESIDUAL_ACTION_LIMIT if terrain_mode else 1.0,
+                observation_action_gain=TERRAIN_RESIDUAL_POLICY_GAIN if terrain_mode else terrain_deployment_gain,
             )
         self.reset(seed=seed)
 
@@ -580,6 +598,34 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             for geom_id in self.go2_foot_geom_ids
         )
         return float(np.clip(min(forward_clearances) / TERRAIN_BOUNDARY_STOP_BUFFER_M, 0.0, 1.0))
+
+    def _record_go2_motion(self) -> None:
+        """Track a rolling physical-motion window for the gravel contract."""
+        if self.terrain_task != "gravel":
+            return
+        now = float(self.data.time)
+        self._go2_motion_samples.append((now, self._path_length))
+        oldest_allowed = now - GRAVEL_MOTION_WINDOW_S
+        while len(self._go2_motion_samples) > 1 and self._go2_motion_samples[1][0] < oldest_allowed:
+            self._go2_motion_samples.popleft()
+
+    def _go2_motion_status(self) -> tuple[bool, float]:
+        """Return moving-state validity and 1 s path-speed estimate.
+
+        It is a simulator-only replay gate.  No Go2 motion truth is injected
+        into the X500 observation or controller.
+        """
+        if self.terrain_task != "gravel":
+            return True, float(np.linalg.norm(self.data.qvel[:2]))
+        if len(self._go2_motion_samples) < 2:
+            return True, 0.0
+        start_time, start_distance = self._go2_motion_samples[0]
+        end_time, end_distance = self._go2_motion_samples[-1]
+        duration = end_time - start_time
+        if duration < 0.80:
+            return True, 0.0
+        speed = max(0.0, (end_distance - start_distance) / duration)
+        return speed >= GRAVEL_MIN_WINDOW_SPEED_MPS, float(speed)
 
     def _sensor(self, name: str) -> np.ndarray:
         """Read one explicit MuJoCo onboard-sensor channel."""
@@ -661,6 +707,8 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         # Match the terrain PPO's requested speed range exactly: three times
         # the former terrain route speed, with grade/footholds still supplied
         # by actual MuJoCo contact rather than a scripted Go2 translation.
+        if self.terrain_task == "gravel":
+            return np.array([GRAVEL_ROUTE_SPEED_MPS[self.difficulty], 0.0, 0.0], dtype=np.float64)
         terrain_speed_scale = 1.0 if self.terrain_task == "flat" else (
             TERRAIN_SPEED_MULTIPLIER * (0.52 if self.terrain_task.startswith("slope") else 0.48)
         )
@@ -675,6 +723,10 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         """Convert the world route into Go2 body-frame velocity and yaw rate."""
         world_velocity = self._path_command(time_s)[:2]
         if self.terrain_task != "flat":
+            if self.terrain_task == "gravel":
+                # Gravel recording has no terminal parking waypoint: Go2 must
+                # keep walking, and a stopped deck can never earn a landing.
+                return np.array([float(world_velocity[0]), 0.0, 0.0], dtype=np.float64)
             # Keep the certified terrain-controller command in the Go2 body
             # frame.  Approach the visible finite-course endpoint at a
             # controlled stop: a longer landing video must not drive an
@@ -1303,6 +1355,8 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self._landing_retry_active = False
         self._landing_retry_count = 0
         self._path_length = 0.0
+        self._go2_motion_samples.clear()
+        self._go2_motion_violation = False
         mujoco.mj_forward(self.model, self.data)
         self._next_estimator_time = 0.0
         self._next_camera_time = 0.0
@@ -1320,6 +1374,7 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self._wind_force_world[:] = 0.0
         self._prev_pad_position = self.pad_position
         self._previous_base_position = self.base_position
+        self._go2_motion_samples.append((float(self.data.time), self._path_length))
         self._previous_go2_foot_positions = self.data.geom_xpos[self.go2_foot_geom_ids].copy()
         self._previous_go2_contact_mask = self._go2_ground_contact_mask()
         self._go2_stance_slip_mps = 0.0
@@ -1374,6 +1429,14 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             current_base = self.base_position
             self._path_length += float(np.linalg.norm(current_base[:2] - self._previous_base_position[:2]))
             self._previous_base_position = current_base
+            self._record_go2_motion()
+            go2_motion_ok, _ = self._go2_motion_status()
+            if (
+                self.terrain_task == "gravel"
+                and float(self.data.time) >= GRAVEL_MOTION_GUARD_START_S
+                and not go2_motion_ok
+            ):
+                self._go2_motion_violation = True
             count, normal, penetration = self._contact_calibration()
             self._offline_sim_landing_skid_contact_count = count
             self._offline_sim_landing_normal_force = normal
@@ -1408,6 +1471,7 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             )
             if (
                 not self._terrain_course_breach
+                and not self._go2_motion_violation
                 and count >= 2
                 and float(np.linalg.norm(instantaneous_relative_velocity)) < 0.40
                 and self._relative_altitude() <= SUCCESS_MAX_RELATIVE_HEIGHT_M
@@ -1435,13 +1499,18 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         go2_tilt_deg = math.degrees(math.acos(float(np.clip(base_up, -1.0, 1.0))))
         terrain_course_inside, terrain_boundary_clearance = self._terrain_course_status()
         terrain_course_breach = self._terrain_course_breach or not terrain_course_inside
+        go2_motion_ok, go2_motion_window_speed = self._go2_motion_status()
+        gravel_motion_ok = (
+            self.terrain_task != "gravel"
+            or (go2_motion_ok and not self._go2_motion_violation)
+        )
         # Physical contacts are simulator-only scoring evidence.  They are
         # never exposed to the stock X500 policy or flight controller.
         stable_contact = (
             self._offline_sim_landing_skid_contact_count >= 2
             and relative_landing_speed < 0.40
         )
-        success = not terrain_course_breach and (
+        success = not terrain_course_breach and gravel_motion_ok and (
             self._touchdown_success_evidence or (
                 stable_contact
                 and relative_altitude <= SUCCESS_MAX_RELATIVE_HEIGHT_M
@@ -1459,7 +1528,10 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         go2_fall = self.base_position[2] < 0.18 or base_up < 0.55
         out_of_bounds = horizontal_distance > 15.0 or self.drone_position[2] > 9.0
-        terminated = success or hard_landing or go2_fall or out_of_bounds or terrain_course_breach
+        terminated = (
+            success or hard_landing or go2_fall or out_of_bounds or terrain_course_breach
+            or self._go2_motion_violation
+        )
         truncated = self._step_count >= self.max_steps
         # The deterministic camera servo already supplies the nominal
         # correction.  Penalize unnecessary raw residual proposals strongly
@@ -1480,6 +1552,8 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         elif out_of_bounds:
             reward -= 25.0
         elif terrain_course_breach:
+            reward -= 90.0
+        elif self._go2_motion_violation:
             reward -= 90.0
         info = {
             "horizontal_error_m": horizontal_distance,
@@ -1505,6 +1579,9 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             "offline_sim_terrain_course_inside": float(terrain_course_inside),
             "offline_sim_terrain_course_breach": float(terrain_course_breach),
             "offline_sim_terrain_boundary_clearance_m": terrain_boundary_clearance,
+            "offline_sim_go2_motion_ok": float(go2_motion_ok),
+            "offline_sim_go2_motion_window_speed_mps": go2_motion_window_speed,
+            "offline_sim_go2_motion_violation": float(self._go2_motion_violation),
             "terrain_ground_height_m": terrain_height_at(
                 self.terrain_task,
                 float(self.base_position[0]),

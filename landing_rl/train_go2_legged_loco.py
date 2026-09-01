@@ -16,6 +16,7 @@ from stable_baselines3.common.utils import set_random_seed
 
 from .go2_legged_loco_environment import (
     DEPLOYMENT_POLICY_ACTION_GAIN,
+    TERRAIN_RESIDUAL_ACTION_LIMIT,
     TERRAIN_RESIDUAL_POLICY_GAIN,
     Go2LeggedLocoEnv,
 )
@@ -123,7 +124,11 @@ def evaluate(
             all_yaw_errors.append(last_info["yaw_rate_error_radps"])
             all_heights.append(last_info["base_height_m"])
             all_clearances.append(last_info["base_height_m"] - last_info["terrain_ground_height_m"])
-            action_saturation.append(float(np.mean(np.abs(action) > 0.95)))
+            applied_action = (
+                TERRAIN_RESIDUAL_POLICY_GAIN * np.clip(action, -TERRAIN_RESIDUAL_ACTION_LIMIT, TERRAIN_RESIDUAL_ACTION_LIMIT)
+                if terrain_task != "flat" else action
+            )
+            action_saturation.append(float(np.mean(np.abs(applied_action) > 0.95)))
             raw_policy_action_saturation.append(float(np.mean(np.abs(raw_action) > 0.95)))
             torque_saturation.append(last_info["torque_saturation_fraction"])
             base_tilts.append(last_info["base_tilt_deg"])
@@ -179,12 +184,20 @@ def evaluate(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--timesteps", type=int, default=40_000)
+    parser.add_argument(
+        "--learning-rate", type=float, default=None,
+        help="Override PPO learning rate; useful for conservative terrain fine-tuning from an accepted gait.",
+    )
     parser.add_argument("--eval-episodes", type=int, default=100)
     parser.add_argument("--robust-eval-episodes", type=int, default=30)
     parser.add_argument("--robust-eval-seed", type=int, default=20290831)
     parser.add_argument("--seed", type=int, default=20260831)
     parser.add_argument("--model", type=Path, default=Path("models/go2_legged_loco_ppo"))
     parser.add_argument("--artifacts-dir", type=Path, default=Path("artifacts/rl_training"))
+    parser.add_argument(
+        "--metrics-file", type=Path, default=None,
+        help="Optional manifest path. Defaults to <artifacts-dir>/go2_legged_loco_metrics.json.",
+    )
     parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument("--terrain", choices=TERRAIN_TASKS, default="flat")
     parser.add_argument(
@@ -213,6 +226,11 @@ def main() -> None:
     else:
         model = PPO.load(args.resume_from, env=env, device="cpu")
         resumed_from = str(args.resume_from)
+        if args.learning_rate is not None:
+            if args.learning_rate <= 0.0:
+                raise ValueError("--learning-rate must be positive")
+            model.learning_rate = float(args.learning_rate)
+            model.lr_schedule = lambda _progress_remaining: float(args.learning_rate)
     model.learn(
         total_timesteps=args.timesteps,
         progress_bar=False,
@@ -347,18 +365,19 @@ def main() -> None:
             "policy_observation_dim": 450,
             "action": (
                 "12 normalized PPO residuals are trained around the trot prior; "
-                f"terrain deployment applies the same nonzero joint residual gain {TERRAIN_RESIDUAL_POLICY_GAIN:.2f} used in training"
+                f"terrain deployment applies the same nonzero joint residual gain {TERRAIN_RESIDUAL_POLICY_GAIN:.2f} and raw-action limit {TERRAIN_RESIDUAL_ACTION_LIMIT:.2f} used in training"
                 if terrain_mode else
                 f"12 normalized PPO residuals, deployment-conditioned by gain {DEPLOYMENT_POLICY_ACTION_GAIN:.2f}, then mapped once by 0.18 rad around the trot prior"
             ),
             "deployment_policy_action_gain": TERRAIN_RESIDUAL_POLICY_GAIN if terrain_mode else DEPLOYMENT_POLICY_ACTION_GAIN,
+            "terrain_raw_action_limit": TERRAIN_RESIDUAL_ACTION_LIMIT if terrain_mode else None,
             "pd": {"stiffness": 60.0, "damping": 2.0, "delay_control_steps": 4},
             "trot": {"duty_factor": 0.58, "phase_offsets": [0.0, 0.5, 0.5, 0.0], "foot_target": "sagittal two-link IK with stance-locked world velocity, smooth Hermite swing, and terrain-mode base-IMU joint-reference feedback"},
         },
         "ppo": {
             "actor_hidden_dims": [512, 256, 128],
             "activation": "ELU",
-            "learning_rate": 0.0001,
+            "learning_rate": float(args.learning_rate) if args.learning_rate is not None else 0.0001,
             "gamma": 0.99,
             "gae_lambda": 0.95,
             "clip_range": 0.10,
@@ -388,7 +407,9 @@ def main() -> None:
         manifest["promotion"] = "accepted candidate copied to canonical model"
     else:
         manifest["promotion"] = "rejected candidate retained; canonical model not overwritten"
-    (args.artifacts_dir / "go2_legged_loco_metrics.json").write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    metrics_path = args.metrics_file or (args.artifacts_dir / "go2_legged_loco_metrics.json")
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     env.close()
     print(json.dumps(manifest, indent=2), flush=True)
     if not acceptance["passed"]:
