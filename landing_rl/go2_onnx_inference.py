@@ -341,6 +341,9 @@ def draw_third_person_hud(
     go2_speed: float,
     go2_slip: float,
     go2_tilt: float,
+    sole_contacts: int,
+    sole_force: float,
+    nonsole_contacts: int,
     detected: bool,
     imu_impact: bool,
     retry_active: bool,
@@ -353,6 +356,7 @@ def draw_third_person_hud(
         f"t={time_s:05.1f}s  QR error={error:.3f} m  relative altitude={altitude:.2f} m",
         f"OFFLINE PHYSICS (NOT A SENSOR): path={path_distance:.2f} m | skid rails={contacts}/2",
         f"GO2 speed={go2_speed:.2f} m/s  | stance slip={go2_slip:.2f} m/s  | tilt={go2_tilt:.1f} deg",
+        f"GO2 RUBBER SOLES={sole_contacts}/4 | normal={sole_force:.1f} N | non-sole terrain contacts={nonsole_contacts}",
         f"TERRAIN: {terrain_label}",
         f"CAMERA POLICY: {'QR DETECTED / TRACK' if detected else 'NO QR / CORRIDOR SEARCH'}",
         f"ONBOARD LANDING: IMU settle={'ON' if imu_impact else 'OFF'} | retry={'ON' if retry_active else 'OFF'} ({retry_count})",
@@ -489,6 +493,9 @@ def main() -> None:
             "offline_sim_terrain_course_inside", "offline_sim_terrain_boundary_clearance_m",
             "offline_sim_go2_motion_ok", "offline_sim_go2_motion_window_speed_mps",
             "offline_sim_go2_motion_violation",
+            "offline_sim_go2_sole_contacts", "offline_sim_go2_sole_normal_force_n",
+            "offline_sim_go2_sole_contact_peak", "offline_sim_go2_nonsole_terrain_contacts",
+            "offline_sim_go2_nonsole_terrain_violation",
             "detected", "qr_center_u", "qr_center_v", "qr_pnp_depth_m",
             "qr_center_rate_u", "qr_center_rate_v", "imu_impact_latched",
             "landing_retry_active", "landing_retry_count", "onnx_provider",
@@ -522,6 +529,9 @@ def main() -> None:
             retry_count = int(current._landing_retry_count)
             go2_speed = float(np.linalg.norm(current.data.qvel[:2]))
             go2_tilt = float(np.degrees(np.arccos(np.clip(current.data.xmat[current.base_id, 8], -1.0, 1.0))))
+            sole_contacts = int(np.count_nonzero(current._previous_go2_contact_mask))
+            sole_force = float(np.sum(current._go2_sole_normal_forces))
+            nonsole_contacts = int(current._go2_nonsole_terrain_contact_count)
             synchronized_state = render_state_fingerprint(current)
             wide_third_person_camera = follow_camera(current)
             renderer.update_scene(current.data, camera=wide_third_person_camera)
@@ -592,6 +602,7 @@ def main() -> None:
                 third, time_s=float(current.data.time), error=error, altitude=altitude,
                 path_distance=float(current._path_length), contacts=contacts, go2_speed=go2_speed,
                 go2_slip=float(current._go2_stance_slip_mps), go2_tilt=go2_tilt, detected=detected,
+                sole_contacts=sole_contacts, sole_force=sole_force, nonsole_contacts=nonsole_contacts,
                 imu_impact=imu_impact, retry_active=retry_active, retry_count=retry_count,
                 terrain_label=terrain_hud_label(
                     current.terrain_task,
@@ -633,6 +644,8 @@ def main() -> None:
                 int(current._go2_motion_status()[0]),
                 f"{current._go2_motion_status()[1]:.6f}",
                 int(current._go2_motion_violation),
+                sole_contacts, f"{sole_force:.6f}", current._go2_sole_contact_peak,
+                nonsole_contacts, int(current._go2_nonsole_terrain_contact_violation),
                 int(detected), f"{current._qr_center_norm[0]:.6f}", f"{current._qr_center_norm[1]:.6f}",
                 f"{current._qr_depth if detected else 0.0:.6f}", f"{current._qr_center_rate[0]:.6f}",
                 f"{current._qr_center_rate[1]:.6f}", int(imu_impact), int(retry_active),

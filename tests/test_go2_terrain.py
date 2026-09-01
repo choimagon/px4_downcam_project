@@ -9,7 +9,12 @@ import numpy as np
 
 from landing_rl.go2_legged_loco_environment import Go2LeggedLocoEnv
 from landing_rl.go2_onnx_inference import terrain_hud_label
-from landing_rl.go2_qr_environment import DRONE_OBSERVATION_NAMES, Go2BackQrLandingEnv, build_go2_landing_xml
+from landing_rl.go2_qr_environment import (
+    DRONE_OBSERVATION_NAMES,
+    Go2BackQrLandingEnv,
+    build_go2_landing_xml,
+    configure_go2_sole_only_ground_contact,
+)
 from landing_rl.go2_terrain import (
     ROUGH_LEVEL_AMPLITUDE_M,
     ROUGH_HFIELD_NAME,
@@ -180,6 +185,33 @@ class Go2TerrainTest(unittest.TestCase):
         self.assertTrue(terminated)
         self.assertEqual(step_info["success"], 0.0)
         self.assertEqual(step_info["offline_sim_go2_motion_violation"], 1.0)
+        env.close()
+
+    def test_gravel_uses_only_official_rubber_paw_ground_contacts(self) -> None:
+        model = mujoco.MjModel.from_xml_string(build_go2_landing_xml(include_drone=False, terrain_task="gravel"))
+        soles, nonsole = configure_go2_sole_only_ground_contact(model)
+        self.assertEqual(len(soles), 4)
+        self.assertGreater(len(nonsole), 0)
+        self.assertTrue(np.all(model.geom_contype[soles] == 1))
+        self.assertTrue(np.all(model.geom_conaffinity[soles] == 1))
+        self.assertTrue(np.all(model.geom_contype[nonsole] == 0))
+        self.assertTrue(np.all(model.geom_conaffinity[nonsole] == 0))
+
+        env = Go2LeggedLocoEnv(
+            terrain_task="gravel", domain_randomization=False, sensor_noise=False, max_steps=120
+        )
+        env.reset(seed=20262001)
+        env._command[:] = (0.75, 0.0, 0.0)
+        env._command_change_at = 1_000_000
+        maximum_sole_force = 0.0
+        for _ in range(100):
+            _, _, terminated, truncated, info = env.step(np.zeros(12, dtype=np.float32))
+            maximum_sole_force = max(maximum_sole_force, info["sole_normal_force_n"])
+            self.assertEqual(info["nonsole_terrain_contacts"], 0.0)
+            self.assertEqual(info["nonsole_terrain_violation"], 0.0)
+            self.assertFalse(terminated)
+            self.assertFalse(truncated)
+        self.assertGreater(maximum_sole_force, 1.0)
         env.close()
 
     def test_video_hud_label_is_font_safe_ascii(self) -> None:

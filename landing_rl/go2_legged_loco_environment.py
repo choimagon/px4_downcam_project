@@ -24,7 +24,12 @@ import mujoco
 import numpy as np
 from gymnasium import spaces
 
-from .go2_qr_environment import GO2_STAND_POSE, build_go2_landing_xml
+from .go2_qr_environment import (
+    GO2_STAND_POSE,
+    GO2_NONSOLE_SUPPORT_FORCE_N,
+    build_go2_landing_xml,
+    configure_go2_sole_only_ground_contact,
+)
 from .go2_terrain import (
     TERRAIN_SPEED_MULTIPLIER,
     TERRAIN_ROUTE_TARGET_X_M,
@@ -99,6 +104,12 @@ TERRAIN_SWING_LIFT_SPEED_GAIN = 0.032
 TERRAIN_FOOT_CENTER_BIAS_M = -0.040
 TERRAIN_PITCH_FOOT_CENTER_GAIN = -0.28
 GAIT_DUTY_FACTOR = 0.58
+# The raw inverse-kinematic terrain swing reaches into the official Go2 calf
+# collision envelope.  Blend it from the official standing pose for gravel so
+# the four stock rubber paws, rather than a lower-leg proxy, carry the robot.
+# This value was selected by fixed-seed no-root-wrench checks at all three
+# declared speed commands (0.58 / 0.75 / 0.92 m/s).
+GRAVEL_SOLE_GAIT_AMPLITUDE = 0.70
 
 
 def _terrain_gait_parameters(task: str) -> tuple[float, float, float, float, float, float]:
@@ -286,7 +297,8 @@ def legged_loco_reference_target(
     # Blend the whole joint vector (not just the stride) into the gait so the
     # controller never kicks the robot from its 0.265 m stand height straight
     # to the extended walking pose on the first 5-ms tick.
-    return STAND_POSE + gait_ramp * (targets - STAND_POSE)
+    gait_amplitude = GRAVEL_SOLE_GAIT_AMPLITUDE if fast_terrain_gait and terrain_task == "gravel" else 1.0
+    return STAND_POSE + gait_ramp * gait_amplitude * (targets - STAND_POSE)
 
 
 class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
@@ -332,9 +344,7 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
         self.actuator_ids = np.array(
             [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name) for name in ACTUATOR_NAMES], dtype=np.int32
         )
-        self.foot_geom_ids = np.array(
-            [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in LEG_ORDER], dtype=np.int32
-        )
+        self.foot_geom_ids, self.nonsole_collision_geom_ids = configure_go2_sole_only_ground_contact(self.model)
         self.ground_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "ground")
         self.terrain_geom_ids = np.array(
             [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in terrain_geom_names(self.terrain_task)],
@@ -370,6 +380,9 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
         self._previous_foot_positions = np.zeros((4, 3), dtype=np.float64)
         self._previous_foot_contact_mask = np.zeros(4, dtype=bool)
         self._last_stance_slip_mps = 0.0
+        self._sole_normal_forces = np.zeros(4, dtype=np.float64)
+        self._nonsole_terrain_contact_count = 0
+        self._nonsole_terrain_contact_violation = False
         self._step_torque_saturation_fraction = 0.0
         self._step_root_wrench_max_abs = 0.0
         self._motor_strength_scale = np.ones(12, dtype=np.float64)
@@ -512,8 +525,11 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
             history.insert(0, history[0].copy())
         return np.concatenate((current, *history[-self.history_length:])).astype(np.float32)
 
-    def _foot_contact_mask(self) -> np.ndarray:
+    def _sole_contact_state(self) -> tuple[np.ndarray, np.ndarray, int]:
+        """Return official paw-sole contacts and reject other leg supports."""
         contacts = np.zeros(4, dtype=bool)
+        normal_forces = np.zeros(4, dtype=np.float64)
+        nonsole_contacts = 0
         support_geoms = {int(self.ground_geom_id), *(int(geom_id) for geom_id in self.terrain_geom_ids)}
         for index in range(self.data.ncon):
             pair = {int(self.data.contact[index].geom1), int(self.data.contact[index].geom2)}
@@ -522,7 +538,19 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
             for foot_index, foot in enumerate(self.foot_geom_ids):
                 if int(foot) in pair:
                     contacts[foot_index] = True
-        return contacts
+                    contact_force = np.zeros(6, dtype=np.float64)
+                    mujoco.mj_contactForce(self.model, self.data, index, contact_force)
+                    normal_forces[foot_index] += abs(float(contact_force[0]))
+            if pair.intersection(int(geom_id) for geom_id in self.nonsole_collision_geom_ids):
+                contact_force = np.zeros(6, dtype=np.float64)
+                mujoco.mj_contactForce(self.model, self.data, index, contact_force)
+                if abs(float(contact_force[0])) >= GO2_NONSOLE_SUPPORT_FORCE_N:
+                    nonsole_contacts += 1
+        return contacts, normal_forces, nonsole_contacts
+
+    def _foot_contact_mask(self) -> np.ndarray:
+        """Compatibility shorthand for the four official rubber sole pads."""
+        return self._sole_contact_state()[0]
 
     def _expected_contact_mask(self) -> np.ndarray:
         speed = float(np.linalg.norm(self._command[:2]))
@@ -597,8 +625,14 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
         mujoco.mj_forward(self.model, self.data)
         self._previous_position = self.base_position
         self._previous_foot_positions = self.data.geom_xpos[self.foot_geom_ids].copy()
-        self._previous_foot_contact_mask = self._foot_contact_mask()
+        initial_sole_contacts, initial_sole_forces, initial_nonsole_contacts = self._sole_contact_state()
+        self._previous_foot_contact_mask = initial_sole_contacts
         self._last_stance_slip_mps = 0.0
+        self._sole_normal_forces[:] = initial_sole_forces
+        # Contact candidates after ``mj_forward`` have not received a native
+        # step force solve, so they cannot prove non-sole weight support.
+        self._nonsole_terrain_contact_count = 0
+        self._nonsole_terrain_contact_violation = False
         self._step_torque_saturation_fraction = 0.0
         self._step_root_wrench_max_abs = 0.0
         current = self._single_observation()
@@ -625,7 +659,12 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
             mujoco.mj_step(self.model, self.data)
             foot_positions = self.data.geom_xpos[self.foot_geom_ids].copy()
             foot_velocity = (foot_positions - self._previous_foot_positions) / float(self.model.opt.timestep)
-            contact_mask = self._foot_contact_mask()
+            contact_mask, sole_forces, nonsole_contacts = self._sole_contact_state()
+            self._sole_normal_forces[:] = sole_forces
+            self._nonsole_terrain_contact_count += nonsole_contacts
+            self._nonsole_terrain_contact_violation = (
+                self._nonsole_terrain_contact_violation or nonsole_contacts > 0
+            )
             stable_contact = contact_mask & self._previous_foot_contact_mask
             stable_slip_samples.extend(np.linalg.norm(foot_velocity[stable_contact, :2], axis=1).tolist())
             self._previous_foot_positions = foot_positions
@@ -649,7 +688,12 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
         position = self.base_position
         self._path_length += float(np.linalg.norm(position[:2] - self._previous_position[:2]))
         self._previous_position = position
-        contact_mask = self._foot_contact_mask()
+        contact_mask, sole_forces, nonsole_contacts = self._sole_contact_state()
+        self._sole_normal_forces[:] = sole_forces
+        self._nonsole_terrain_contact_count += nonsole_contacts
+        self._nonsole_terrain_contact_violation = (
+            self._nonsole_terrain_contact_violation or nonsole_contacts > 0
+        )
         feet = int(np.count_nonzero(contact_mask))
         gait_match = float(np.mean(contact_mask == self._expected_contact_mask()))
         terrain_height = terrain_height_at(
@@ -701,7 +745,7 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
                 - 0.12 * float(np.dot(action - self._last_action, action - self._last_action))
                 - 0.20 * self._step_torque_saturation_fraction
             )
-        fallen = position[2] < 0.18 or base_up < 0.55
+        fallen = position[2] < 0.18 or base_up < 0.55 or self._nonsole_terrain_contact_violation
         if fallen:
             reward -= 260.0 if self.terrain_task != "flat" else 40.0
         self._last_action = effective_action
@@ -730,6 +774,9 @@ class Go2LeggedLocoEnv(gym.Env[np.ndarray, np.ndarray]):
             "yaw_rate_error_radps": abs(yaw_rate_error),
             "base_up": base_up,
             "foot_contacts": float(feet),
+            "sole_normal_force_n": float(np.sum(self._sole_normal_forces)),
+            "nonsole_terrain_contacts": float(self._nonsole_terrain_contact_count),
+            "nonsole_terrain_violation": float(self._nonsole_terrain_contact_violation),
             "gait_contact_match": gait_match,
             "stance_foot_slip_mps": self._last_stance_slip_mps,
             "base_height_m": float(position[2]),

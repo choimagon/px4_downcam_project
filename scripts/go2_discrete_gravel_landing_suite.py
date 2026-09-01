@@ -3,8 +3,9 @@
 
 The three difficulty stages are intentionally identical except for the Go2
 forward-speed command.  A recording is rejected if Go2 falls, leaves the
-finite collision road, loses the one-second motion-window requirement, or if
-the X500 never produces a two-skid physical landing.
+finite collision road, loses the one-second motion-window requirement, uses
+any non-sole Go2 leg collision as terrain support, or if the X500 never
+produces a two-skid physical landing.
 """
 
 from __future__ import annotations
@@ -64,6 +65,9 @@ def summarize_csv(path: Path) -> dict[str, float]:
         "offline_sim_terrain_boundary_clearance_m", "offline_sim_go2_motion_ok",
         "offline_sim_go2_motion_window_speed_mps", "offline_sim_go2_motion_violation",
         "offline_sim_go2_speed_mps", "offline_sim_go2_path_distance_m",
+        "offline_sim_go2_sole_contacts", "offline_sim_go2_sole_normal_force_n",
+        "offline_sim_go2_sole_contact_peak", "offline_sim_go2_nonsole_terrain_contacts",
+        "offline_sim_go2_nonsole_terrain_violation",
     }
     if not rows or not required.issubset(set(rows[0])):
         raise RuntimeError(f"discrete-gravel CSV lacks required diagnostics: {path}")
@@ -76,6 +80,11 @@ def summarize_csv(path: Path) -> dict[str, float]:
     inside = numeric("offline_sim_terrain_course_inside")
     wrench = numeric("offline_sim_go2_root_wrench_max_abs")
     violation = numeric("offline_sim_go2_motion_violation")
+    sole_contacts = numeric("offline_sim_go2_sole_contacts")
+    sole_force = numeric("offline_sim_go2_sole_normal_force_n")
+    sole_peak = numeric("offline_sim_go2_sole_contact_peak")
+    nonsole_contacts = numeric("offline_sim_go2_nonsole_terrain_contacts")
+    nonsole_violation = numeric("offline_sim_go2_nonsole_terrain_violation")
     moving_rows = [
         row for row in rows
         if float(row["sim_time_s"]) >= GRAVEL_MOTION_GUARD_START_S
@@ -92,6 +101,10 @@ def summarize_csv(path: Path) -> dict[str, float]:
         raise RuntimeError(f"Go2 root wrench is nonzero: {path}")
     if max(violation) > 0.0:
         raise RuntimeError(f"Go2 stopped during a gravel-road landing: {path}")
+    if max(nonsole_contacts) > 0.0 or max(nonsole_violation) > 0.0:
+        raise RuntimeError(f"Go2 used a non-sole leg collision on terrain: {path}")
+    if max(sole_contacts) < 2.0 or max(sole_peak) < 2.0 or max(sole_force) <= 1.0:
+        raise RuntimeError(f"Go2 never established physical rubber-sole support: {path}")
     if not moving_rows:
         raise RuntimeError(f"recording ends before gravel motion guard: {path}")
     window_speeds = [float(row["offline_sim_go2_motion_window_speed_mps"]) for row in moving_rows]
@@ -110,6 +123,9 @@ def summarize_csv(path: Path) -> dict[str, float]:
         "terminal_go2_speed_mps": float(rows[-1]["offline_sim_go2_speed_mps"]),
         "terminal_motion_window_speed_mps": float(rows[-1]["offline_sim_go2_motion_window_speed_mps"]),
         "min_motion_window_speed_mps": min(window_speeds),
+        "max_go2_sole_contacts": max(sole_contacts),
+        "max_go2_sole_normal_force_n": max(sole_force),
+        "max_go2_nonsole_terrain_contacts": max(nonsole_contacts),
     }
 
 

@@ -42,6 +42,65 @@ GO2_MESH_DIR = GO2_XML_SOURCE.parent / "assets"
 X500_MESH_DIR = PROJECT_ROOT / "assets" / "mujoco_x500"
 GO2_STAND_POSE = np.tile(np.array([0.0, 0.805, -1.610], dtype=np.float64), 4)
 GO2_STAND_POSE[0::3] = np.array([0.10, -0.10, 0.10, -0.10], dtype=np.float64)
+# These are the named collision geoms supplied by Unitree's official Go2
+# MJCF.  They are the rubber paw/sole at the bottom of each rendered foot --
+# Go2 has no actuated ankle or heel joint.  All other collidable leg links
+# remain physical, but any terrain contact through one of them is a failure;
+# only these four foot soles may support a valid walking/landing replay.
+GO2_SOLE_GEOM_NAMES = ("FR", "FL", "RR", "RL")
+# A collision pair can remain in MuJoCo's broad/narrow phase at zero normal
+# load while a rounded foot leaves a nearby calf link close to the soil.  That
+# is not a support.  Only a loaded non-sole collision is prohibited; this
+# threshold is deliberately far below one leg's ordinary ~50 N support load.
+GO2_NONSOLE_SUPPORT_FORCE_N = 5.0
+
+
+def go2_sole_and_nonsole_collision_geom_ids(model: mujoco.MjModel) -> tuple[np.ndarray, np.ndarray]:
+    """Return official Go2 rubber-sole and all other active Go2 collision IDs.
+
+    The QR deck is intentionally excluded: it is a payload contact surface
+    for X500, not a Go2 leg link.  Visual mesh geoms have no collision bits,
+    so they cannot appear in the non-sole set.
+    """
+    sole_ids = np.array(
+        [mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in GO2_SOLE_GEOM_NAMES],
+        dtype=np.int32,
+    )
+    if np.any(sole_ids < 0):
+        raise RuntimeError("official Go2 rubber sole collision geometry is missing")
+    sole_set = {int(geom_id) for geom_id in sole_ids}
+    nonsole: list[int] = []
+    for geom_id in range(model.ngeom):
+        if geom_id in sole_set:
+            continue
+        if int(model.geom_contype[geom_id]) == 0 and int(model.geom_conaffinity[geom_id]) == 0:
+            continue
+        body_name = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_BODY, int(model.geom_bodyid[geom_id]))
+        # Official Go2 collision links belong to base_link or one of the four
+        # leg branches.  The fixed QR mount belongs to qr_mount and is not a
+        # leg support candidate.
+        if body_name == "base_link" or (body_name is not None and body_name.startswith(GO2_SOLE_GEOM_NAMES)):
+            nonsole.append(geom_id)
+    return sole_ids, np.asarray(nonsole, dtype=np.int32)
+
+
+def configure_go2_sole_only_ground_contact(model: mujoco.MjModel) -> tuple[np.ndarray, np.ndarray]:
+    """Make official Go2 paw pads the only terrain-collidable robot links.
+
+    Unitree's stock foot collision spheres already match the visible rubber
+    paw mesh bottom.  The stock calf/thigh/base collision proxies are useful
+    for a general all-body simulator, but on a narrow walking task they can
+    briefly scrape a heightfield and inject an artificial second support.
+    Disable those proxies here rather than treating an ankle/calf scrape as a
+    valid foothold.  The base is still protected by height/tilt fall gates;
+    propulsion and support forces can only pass through FR/FL/RR/RL paws.
+    """
+    sole_ids, nonsole_ids = go2_sole_and_nonsole_collision_geom_ids(model)
+    model.geom_contype[sole_ids] = 1
+    model.geom_conaffinity[sole_ids] = 1
+    model.geom_contype[nonsole_ids] = 0
+    model.geom_conaffinity[nonsole_ids] = 0
+    return sole_ids, nonsole_ids
 
 # Conservative horizontal envelopes of the moving hardware.  A finite terrain
 # landing is valid only while the Go2 chassis/feet and QR collision plate are
@@ -436,10 +495,7 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_ACTUATOR, name) for name in ("FR_hip", "FR_thigh", "FR_calf", "FL_hip", "FL_thigh", "FL_calf", "RR_hip", "RR_thigh", "RR_calf", "RL_hip", "RL_thigh", "RL_calf")],
             dtype=np.int32,
         )
-        self.go2_foot_geom_ids = np.array(
-            [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in ("FR", "FL", "RR", "RL")],
-            dtype=np.int32,
-        )
+        self.go2_foot_geom_ids, self.go2_nonsole_collision_geom_ids = configure_go2_sole_only_ground_contact(self.model)
         self.ground_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "ground")
         self.terrain_geom_ids = np.array(
             [mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, name) for name in terrain_geom_names(self.terrain_task)],
@@ -512,6 +568,10 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self._previous_go2_foot_positions = np.zeros((4, 3), dtype=np.float64)
         self._previous_go2_contact_mask = np.zeros(4, dtype=bool)
         self._go2_stance_slip_mps = 0.0
+        self._go2_sole_normal_forces = np.zeros(4, dtype=np.float64)
+        self._go2_sole_contact_peak = 0
+        self._go2_nonsole_terrain_contact_count = 0
+        self._go2_nonsole_terrain_contact_violation = False
         # Inference can install a render-only observer to capture true 5 ms
         # substeps at 30 fps.  Training and evaluation leave it unset.
         self.physics_observer: Callable[["Go2BackQrLandingEnv"], None] | None = None
@@ -1020,8 +1080,17 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             penetration = max(penetration, max(0.0, -float(contact.dist)))
         return len(contacting_skids), normal_force, penetration
 
-    def _go2_ground_contact_mask(self) -> np.ndarray:
+    def _go2_sole_contact_state(self) -> tuple[np.ndarray, np.ndarray, int]:
+        """Measure native-step terrain contacts through official Go2 soles.
+
+        This is an offline simulator safety label.  It is never exposed to
+        the X500 observation/controller, but it prevents a replay from being
+        counted as walking or landing if a calf, thigh, hip, or chassis
+        collision shape is used as a ground support instead of a rubber paw.
+        """
         contacts = np.zeros(4, dtype=bool)
+        normal_forces = np.zeros(4, dtype=np.float64)
+        nonsole_contacts = 0
         support_geoms = {int(self.ground_geom_id), *(int(geom_id) for geom_id in self.terrain_geom_ids)}
         for contact_index in range(self.data.ncon):
             contact = self.data.contact[contact_index]
@@ -1031,7 +1100,19 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             for foot_index, geom_id in enumerate(self.go2_foot_geom_ids):
                 if int(geom_id) in pair:
                     contacts[foot_index] = True
-        return contacts
+                    contact_force = np.zeros(6, dtype=np.float64)
+                    mujoco.mj_contactForce(self.model, self.data, contact_index, contact_force)
+                    normal_forces[foot_index] += abs(float(contact_force[0]))
+            if pair.intersection(int(geom_id) for geom_id in self.go2_nonsole_collision_geom_ids):
+                contact_force = np.zeros(6, dtype=np.float64)
+                mujoco.mj_contactForce(self.model, self.data, contact_index, contact_force)
+                if abs(float(contact_force[0])) >= GO2_NONSOLE_SUPPORT_FORCE_N:
+                    nonsole_contacts += 1
+        return contacts, normal_forces, nonsole_contacts
+
+    def _go2_ground_contact_mask(self) -> np.ndarray:
+        """Compatibility shorthand for callers that need only sole contacts."""
+        return self._go2_sole_contact_state()[0]
 
     def _drone_control(self, action: np.ndarray, *, update_alignment: bool) -> None:
         """Control X500 from its onboard sensors and cached QR PnP only.
@@ -1357,6 +1438,10 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self._path_length = 0.0
         self._go2_motion_samples.clear()
         self._go2_motion_violation = False
+        self._go2_sole_normal_forces[:] = 0.0
+        self._go2_sole_contact_peak = 0
+        self._go2_nonsole_terrain_contact_count = 0
+        self._go2_nonsole_terrain_contact_violation = False
         mujoco.mj_forward(self.model, self.data)
         self._next_estimator_time = 0.0
         self._next_camera_time = 0.0
@@ -1376,7 +1461,15 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self._previous_base_position = self.base_position
         self._go2_motion_samples.append((float(self.data.time), self._path_length))
         self._previous_go2_foot_positions = self.data.geom_xpos[self.go2_foot_geom_ids].copy()
-        self._previous_go2_contact_mask = self._go2_ground_contact_mask()
+        initial_go2_contacts, initial_sole_forces, initial_nonsole_contacts = self._go2_sole_contact_state()
+        self._previous_go2_contact_mask = initial_go2_contacts
+        self._go2_sole_normal_forces[:] = initial_sole_forces
+        self._go2_sole_contact_peak = int(np.count_nonzero(initial_go2_contacts))
+        # ``mj_forward`` creates contact candidates but not a native-step
+        # support-force solve.  Only contacts measured after ``mj_step`` can
+        # be treated as an actual non-sole support violation.
+        self._go2_nonsole_terrain_contact_count = 0
+        self._go2_nonsole_terrain_contact_violation = False
         self._go2_stance_slip_mps = 0.0
         self._pad_velocity[:] = self._path_command(0.0)[:2]
         self._pad_vertical_velocity = 0.0
@@ -1445,7 +1538,13 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             )
             foot_positions = self.data.geom_xpos[self.go2_foot_geom_ids].copy()
             foot_velocity = (foot_positions - self._previous_go2_foot_positions) / float(self.model.opt.timestep)
-            go2_contacts = self._go2_ground_contact_mask()
+            go2_contacts, sole_forces, nonsole_contacts = self._go2_sole_contact_state()
+            self._go2_sole_normal_forces[:] = sole_forces
+            self._go2_sole_contact_peak = max(self._go2_sole_contact_peak, int(np.count_nonzero(go2_contacts)))
+            self._go2_nonsole_terrain_contact_count += nonsole_contacts
+            self._go2_nonsole_terrain_contact_violation = (
+                self._go2_nonsole_terrain_contact_violation or nonsole_contacts > 0
+            )
             stable_go2_contacts = go2_contacts & self._previous_go2_contact_mask
             if np.any(stable_go2_contacts):
                 instantaneous_slip = float(np.mean(np.linalg.norm(foot_velocity[stable_go2_contacts, :2], axis=1)))
@@ -1472,6 +1571,7 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             if (
                 not self._terrain_course_breach
                 and not self._go2_motion_violation
+                and not self._go2_nonsole_terrain_contact_violation
                 and count >= 2
                 and float(np.linalg.norm(instantaneous_relative_velocity)) < 0.40
                 and self._relative_altitude() <= SUCCESS_MAX_RELATIVE_HEIGHT_M
@@ -1510,11 +1610,17 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             self._offline_sim_landing_skid_contact_count >= 2
             and relative_landing_speed < 0.40
         )
-        success = not terrain_course_breach and gravel_motion_ok and (
+        success = (
+            not terrain_course_breach
+            and gravel_motion_ok
+            and not self._go2_nonsole_terrain_contact_violation
+            and self._go2_sole_contact_peak >= 2
+            and (
             self._touchdown_success_evidence or (
                 stable_contact
                 and relative_altitude <= SUCCESS_MAX_RELATIVE_HEIGHT_M
                 and horizontal_distance < float(self.profile["landing"])
+            )
             )
         )
         hard_landing = (
@@ -1530,7 +1636,7 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         out_of_bounds = horizontal_distance > 15.0 or self.drone_position[2] > 9.0
         terminated = (
             success or hard_landing or go2_fall or out_of_bounds or terrain_course_breach
-            or self._go2_motion_violation
+            or self._go2_motion_violation or self._go2_nonsole_terrain_contact_violation
         )
         truncated = self._step_count >= self.max_steps
         # The deterministic camera servo already supplies the nominal
@@ -1555,6 +1661,8 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             reward -= 90.0
         elif self._go2_motion_violation:
             reward -= 90.0
+        elif self._go2_nonsole_terrain_contact_violation:
+            reward -= 110.0
         info = {
             "horizontal_error_m": horizontal_distance,
             "altitude_m": relative_altitude,
@@ -1574,6 +1682,11 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             "go2_speed_mps": float(np.linalg.norm(self.data.qvel[:2])),
             "offline_sim_relative_landing_speed_mps": relative_landing_speed,
             "go2_stance_slip_mps": self._go2_stance_slip_mps,
+            "offline_sim_go2_sole_contacts": float(np.count_nonzero(go2_contacts)),
+            "offline_sim_go2_sole_normal_force_n": float(np.sum(self._go2_sole_normal_forces)),
+            "offline_sim_go2_sole_contact_peak": float(self._go2_sole_contact_peak),
+            "offline_sim_go2_nonsole_terrain_contacts": float(self._go2_nonsole_terrain_contact_count),
+            "offline_sim_go2_nonsole_terrain_violation": float(self._go2_nonsole_terrain_contact_violation),
             "go2_base_height_m": float(self.base_position[2]),
             "go2_tilt_deg": go2_tilt_deg,
             "offline_sim_terrain_course_inside": float(terrain_course_inside),
