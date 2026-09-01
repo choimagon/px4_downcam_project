@@ -536,9 +536,13 @@ class Go2BackQrEnvironmentTest(unittest.TestCase):
             # by the camera boundary; pad_position is a simulator accessor.
             "qr_site_id": {"__init__", "pad_position", "_update_qr_camera_measurement"},
             "mount_id": {"__init__", "_update_qr_camera_measurement"},
-            # The accessor and derived truth metrics are restricted to reset
-            # randomization and simulator-only reward/scoring in step().
-            "pad_position": {"_relative_altitude", "_horizontal_error", "reset", "step"},
+            # The accessor and derived truth metrics are restricted to reset,
+            # simulator-only reward/scoring, and the finite-terrain Go2/QR
+            # containment guard.  They never enter X500 observation/control.
+            "pad_position": {
+                "_relative_altitude", "_horizontal_error", "reset", "step",
+                "_terrain_course_status", "_terrain_boundary_speed_scale",
+            },
             "_relative_altitude": {"reset", "step"},
             "_horizontal_error": {"step"},
             "_pad_velocity": {"__init__", "reset", "step"},

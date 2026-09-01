@@ -16,12 +16,22 @@ from landing_rl.go2_terrain import (
     SLOPE_GRADE,
     SLOPE_GRADE_PERCENT,
     configure_rough_terrain,
+    terrain_course_bounds,
+    terrain_edge_clearance_m,
     terrain_metadata,
     terrain_height_at,
 )
 
 
 class Go2TerrainTest(unittest.TestCase):
+    def test_finite_course_bounds_and_signed_edge_clearance(self) -> None:
+        self.assertEqual(terrain_course_bounds("flat"), None)
+        self.assertTrue(np.isinf(terrain_edge_clearance_m("flat", 1_000.0, 1_000.0)))
+        self.assertGreater(terrain_edge_clearance_m("slope_up", 0.0, 0.0), 0.0)
+        self.assertLess(terrain_edge_clearance_m("slope_down", 15.1, 0.0), 0.0)
+        self.assertGreater(terrain_edge_clearance_m("rough", 1.0, 0.0), 0.0)
+        self.assertLess(terrain_edge_clearance_m("rough", 1.0, 1.25), 0.0)
+
     def test_slope_is_a_visible_physical_collision_surface(self) -> None:
         model = mujoco.MjModel.from_xml_string(build_go2_landing_xml(include_drone=False, terrain_task="slope_up"))
         slope = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "terrain_slope_up")
@@ -97,7 +107,24 @@ class Go2TerrainTest(unittest.TestCase):
         self.assertFalse(any("terrain" in name or "go2" in name for name in DRONE_OBSERVATION_NAMES))
         _, _, _, _, info = env.step(np.zeros(2, dtype=np.float32))
         self.assertIn("terrain_ground_height_m", info)
+        self.assertIn("offline_sim_terrain_course_inside", info)
+        self.assertGreaterEqual(info["offline_sim_terrain_boundary_clearance_m"], 0.0)
         self.assertEqual(info["go2_assist_force_n"], 0.0)
+        env.close()
+
+    def test_terrain_exit_latches_and_blocks_landing_success(self) -> None:
+        env = Go2BackQrLandingEnv(terrain_task="slope_up", difficulty="easy")
+        env.reset(seed=23)
+        # Put the actual Go2 free body beyond the 16 m collision course.  The
+        # QR deck follows it rigidly, so this is a direct check that terrain
+        # departure cannot later be reported as a successful X500 landing.
+        env.data.qpos[0] = 16.0
+        mujoco.mj_forward(env.model, env.data)
+        self.assertFalse(env._terrain_course_status()[0])
+        _, _, terminated, _, info = env.step(np.zeros(2, dtype=np.float32))
+        self.assertTrue(terminated)
+        self.assertEqual(info["success"], 0.0)
+        self.assertEqual(info["offline_sim_terrain_course_breach"], 1.0)
         env.close()
 
     def test_video_hud_label_is_font_safe_ascii(self) -> None:

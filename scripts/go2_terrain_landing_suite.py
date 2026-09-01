@@ -72,7 +72,8 @@ def summarize_csv(path: Path) -> dict[str, float]:
         "offline_sim_landing_skid_contacts", "offline_sim_max_contact_penetration_m",
         "offline_sim_go2_root_wrench_max_abs", "qr_error_m", "altitude_m",
         "offline_sim_go2_tilt_deg", "offline_sim_terrain_ground_height_m",
-        "offline_sim_terrain_rough_level",
+        "offline_sim_terrain_rough_level", "offline_sim_terrain_course_inside",
+        "offline_sim_terrain_boundary_clearance_m",
     }
     if not rows or not required.issubset(rows[0]):
         raise RuntimeError(f"terrain inference CSV missing required diagnostics: {path}")
@@ -93,6 +94,10 @@ def summarize_csv(path: Path) -> dict[str, float]:
     max_tilt = max(numeric("offline_sim_go2_tilt_deg"))
     if max_tilt > 40.0:
         raise RuntimeError(f"recording Go2 tilt exceeds replay gate: {path}")
+    terrain_inside = numeric("offline_sim_terrain_course_inside")
+    terrain_clearance = numeric("offline_sim_terrain_boundary_clearance_m")
+    if min(terrain_inside) < 1.0 or min(terrain_clearance) < 0.0:
+        raise RuntimeError(f"recording leaves its physical terrain course: {path}")
     return {
         "frames": float(len(rows)),
         "duration_s": float(rows[-1]["sim_time_s"]),
@@ -103,6 +108,7 @@ def summarize_csv(path: Path) -> dict[str, float]:
         "max_go2_tilt_deg": max_tilt,
         "terminal_terrain_height_m": float(rows[-1]["offline_sim_terrain_ground_height_m"]),
         "rough_level": float(rows[-1]["offline_sim_terrain_rough_level"]),
+        "min_terrain_boundary_clearance_m": min(terrain_clearance),
     }
 
 
@@ -191,7 +197,7 @@ def main() -> None:
                     "scenario": slug,
                     "seed": selected_seed,
                     "onnx_sha256": sha256_file(staged_onnx[algorithm]),
-                    "locomotion_controller": "terrain-specific physical IMU/odometry reference gait; learned Go2 residual disabled",
+                    "locomotion_controller": "terrain-specific physical IMU/odometry reference gait; learned Go2 residual disabled; Go2 and QR deck remain inside the collision course",
                     "artifact_sha256": {suffix: sha256_file(path) for suffix, path in (("mp4", video), ("png", snapshot), ("csv", log))},
                     "summary": summary,
                 }
@@ -211,12 +217,12 @@ def main() -> None:
             scenario_records.append({
                 "id": slug, "terrain_task": task, "rough_level": level,
                 "korean_name": korean_name, "locomotion_model": "reference_terrain_gait",
-                "locomotion_verification": "combined Go2+X500 fixed-seed replay; Go2 fall=0, peak tilt<=40deg, root wrench=0",
+                "locomotion_verification": "combined Go2+X500 fixed-seed replay; Go2 fall=0, peak tilt<=40deg, root wrench=0, every frame Go2+QR deck inside physical terrain",
             })
         report = {
             "status": "passed",
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "description": "Physical MuJoCo 10%-grade (5.71-degree) uphill/downhill and 24/48/80mm continuous rough-terrain QR landing suite. Every published fixed-seed replay passes Go2 fall=0, Go2 peak tilt<=40deg, physical two-skid landing contact, zero Go2 root wrench, and synchronized close third-person/wide-X500 inset/down-camera recording.",
+            "description": "Physical MuJoCo 10%-grade (5.71-degree) uphill/downhill and 24/48/80mm continuous rough-terrain QR landing suite. Every published fixed-seed replay passes Go2 fall=0, Go2 peak tilt<=40deg, Go2+QR deck containment within the finite collision course, physical two-skid landing contact, zero Go2 root wrench, and synchronized close third-person/wide-X500 inset/down-camera recording.",
             "algorithms": list(ALGORITHMS),
             "scenarios": scenario_records,
             "demonstrations": records,

@@ -22,6 +22,8 @@ from .go2_terrain import (
     TERRAIN_SPEED_MULTIPLIER,
     TERRAIN_TASKS,
     configure_rough_terrain,
+    terrain_course_bounds,
+    terrain_edge_clearance_m,
     terrain_geom_names,
     terrain_asset_xml,
     terrain_height_at,
@@ -39,6 +41,13 @@ GO2_MESH_DIR = GO2_XML_SOURCE.parent / "assets"
 X500_MESH_DIR = PROJECT_ROOT / "assets" / "mujoco_x500"
 GO2_STAND_POSE = np.tile(np.array([0.0, 0.805, -1.610], dtype=np.float64), 4)
 GO2_STAND_POSE[0::3] = np.array([0.10, -0.10, 0.10, -0.10], dtype=np.float64)
+
+# Conservative horizontal envelopes of the moving hardware.  A finite terrain
+# landing is valid only while the Go2 chassis/feet and QR collision plate are
+# over its collision surface, not merely while the Go2 root point is inside a
+# rectangular bound.  The plate's exact collision radius is read from MuJoCo.
+GO2_TERRAIN_BODY_RADIUS_M = 0.30
+TERRAIN_BOUNDARY_STOP_BUFFER_M = 0.90
 
 # This tuple is the auditable policy-input contract.  Every element is
 # available from the stock X500/PX4 stack: a QR detector/PnP pipeline on the
@@ -479,6 +488,7 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self._offline_sim_landing_skid_contact_count = 0
         self._offline_sim_max_contact_penetration = 0.0
         self._touchdown_success_evidence = False
+        self._terrain_course_breach = False
         self._imu_impact_latched = False
         self._imu_impact_time = float("-inf")
         self._commanded_specific_force_body_z = abs(float(self.model.opt.gravity[2]))
@@ -522,6 +532,54 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
     @property
     def base_position(self) -> np.ndarray:
         return self.data.xpos[self.base_id].copy()
+
+    def _terrain_course_status(self) -> tuple[bool, float]:
+        """Return containment of the Go2 body and QR deck in the real course.
+
+        This is simulator-only safety/evaluation logic.  It never enters the
+        seven X500 policy inputs or its flight controller.  A breach is latched
+        for an episode, so a target cannot leave the terrain, return, and then
+        claim a successful QR landing.
+        """
+        if self.terrain_task == "flat":
+            return True, float("inf")
+        base = self.base_position
+        pad = self.pad_position
+        clearances = [
+            terrain_edge_clearance_m(self.terrain_task, float(base[0]), float(base[1]))
+            - GO2_TERRAIN_BODY_RADIUS_M,
+            terrain_edge_clearance_m(self.terrain_task, float(pad[0]), float(pad[1]))
+            - float(self.model.geom_rbound[self.landing_surface_id]),
+        ]
+        # Feet are actual MuJoCo collision spheres, so their exact dynamic
+        # positions and radii are safer and less over-conservative than a
+        # large circle around the Go2 root during an ordinary lateral trot.
+        clearances.extend(
+            terrain_edge_clearance_m(
+                self.terrain_task, float(self.data.geom_xpos[geom_id, 0]), float(self.data.geom_xpos[geom_id, 1])
+            ) - float(self.model.geom_rbound[geom_id])
+            for geom_id in self.go2_foot_geom_ids
+        )
+        clearance = min(clearances)
+        return clearance >= 0.0, float(clearance)
+
+    def _terrain_boundary_speed_scale(self) -> float:
+        """Slow/stop the physical gait before the forward course edge."""
+        bounds = terrain_course_bounds(self.terrain_task)
+        if bounds is None:
+            return 1.0
+        _, xmax, _, _ = bounds
+        base = self.base_position
+        pad = self.pad_position
+        forward_clearances = [
+            xmax - float(base[0]) - GO2_TERRAIN_BODY_RADIUS_M,
+            xmax - float(pad[0]) - float(self.model.geom_rbound[self.landing_surface_id]),
+        ]
+        forward_clearances.extend(
+            xmax - float(self.data.geom_xpos[geom_id, 0]) - float(self.model.geom_rbound[geom_id])
+            for geom_id in self.go2_foot_geom_ids
+        )
+        return float(np.clip(min(forward_clearances) / TERRAIN_BOUNDARY_STOP_BUFFER_M, 0.0, 1.0))
 
     def _sensor(self, name: str) -> np.ndarray:
         """Read one explicit MuJoCo onboard-sensor channel."""
@@ -626,7 +684,14 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             if progress >= 11.5:
                 return np.zeros(3, dtype=np.float64)
             endpoint_scale = float(np.clip((11.5 - progress) / 1.0, 0.0, 1.0))
-            return np.array([endpoint_scale * float(world_velocity[0]), 0.0, 0.0], dtype=np.float64)
+            # The 12 m route is the ordinary stop.  This extra forward-edge
+            # guard applies no hidden root force; lateral drift is supervised
+            # by the physical-course containment gate below.
+            boundary_scale = self._terrain_boundary_speed_scale()
+            return np.array(
+                [min(endpoint_scale, boundary_scale) * float(world_velocity[0]), 0.0, 0.0],
+                dtype=np.float64,
+            )
         rotation = self.data.xmat[self.base_id].reshape(3, 3)
         body_velocity = rotation[:2, :2].T @ world_velocity
         current_yaw = math.atan2(float(rotation[1, 0]), float(rotation[0, 0]))
@@ -1231,6 +1296,7 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self._offline_sim_landing_normal_force = 0.0
         self._offline_sim_max_contact_penetration = 0.0
         self._touchdown_success_evidence = False
+        self._terrain_course_breach = False
         self._imu_impact_latched = False
         self._imu_impact_time = float("-inf")
         self._commanded_specific_force_body_z = abs(float(self.model.opt.gravity[2]))
@@ -1293,6 +1359,8 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             self._drone_control(action, update_alignment=physics_index == 0)
             self._apply_wind_disturbance()
             mujoco.mj_step(self.model, self.data)
+            terrain_course_inside, _ = self._terrain_course_status()
+            self._terrain_course_breach = self._terrain_course_breach or not terrain_course_inside
             self._update_onboard_estimator()
             self._update_imu_landing_state()
             current_pad = self.pad_position
@@ -1339,7 +1407,8 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
                 dtype=np.float64,
             )
             if (
-                count >= 2
+                not self._terrain_course_breach
+                and count >= 2
                 and float(np.linalg.norm(instantaneous_relative_velocity)) < 0.40
                 and self._relative_altitude() <= SUCCESS_MAX_RELATIVE_HEIGHT_M
                 and float(np.linalg.norm(self._horizontal_error())) < float(self.profile["landing"])
@@ -1364,16 +1433,20 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         relative_landing_speed = float(np.linalg.norm(relative_landing_velocity))
         base_up = float(self.data.xmat[self.base_id, 8])
         go2_tilt_deg = math.degrees(math.acos(float(np.clip(base_up, -1.0, 1.0))))
+        terrain_course_inside, terrain_boundary_clearance = self._terrain_course_status()
+        terrain_course_breach = self._terrain_course_breach or not terrain_course_inside
         # Physical contacts are simulator-only scoring evidence.  They are
         # never exposed to the stock X500 policy or flight controller.
         stable_contact = (
             self._offline_sim_landing_skid_contact_count >= 2
             and relative_landing_speed < 0.40
         )
-        success = self._touchdown_success_evidence or (
-            stable_contact
-            and relative_altitude <= SUCCESS_MAX_RELATIVE_HEIGHT_M
-            and horizontal_distance < float(self.profile["landing"])
+        success = not terrain_course_breach and (
+            self._touchdown_success_evidence or (
+                stable_contact
+                and relative_altitude <= SUCCESS_MAX_RELATIVE_HEIGHT_M
+                and horizontal_distance < float(self.profile["landing"])
+            )
         )
         hard_landing = (
             relative_altitude <= DEEP_PENETRATION_HEIGHT_M
@@ -1386,7 +1459,7 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         )
         go2_fall = self.base_position[2] < 0.18 or base_up < 0.55
         out_of_bounds = horizontal_distance > 15.0 or self.drone_position[2] > 9.0
-        terminated = success or hard_landing or go2_fall or out_of_bounds
+        terminated = success or hard_landing or go2_fall or out_of_bounds or terrain_course_breach
         truncated = self._step_count >= self.max_steps
         # The deterministic camera servo already supplies the nominal
         # correction.  Penalize unnecessary raw residual proposals strongly
@@ -1406,6 +1479,8 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             reward -= 80.0
         elif out_of_bounds:
             reward -= 25.0
+        elif terrain_course_breach:
+            reward -= 90.0
         info = {
             "horizontal_error_m": horizontal_distance,
             "altitude_m": relative_altitude,
@@ -1427,6 +1502,9 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             "go2_stance_slip_mps": self._go2_stance_slip_mps,
             "go2_base_height_m": float(self.base_position[2]),
             "go2_tilt_deg": go2_tilt_deg,
+            "offline_sim_terrain_course_inside": float(terrain_course_inside),
+            "offline_sim_terrain_course_breach": float(terrain_course_breach),
+            "offline_sim_terrain_boundary_clearance_m": terrain_boundary_clearance,
             "terrain_ground_height_m": terrain_height_at(
                 self.terrain_task,
                 float(self.base_position[0]),

@@ -75,6 +75,43 @@ def validate_rough_level(level: int | None) -> int:
     return int(level)
 
 
+def terrain_course_bounds(task: str) -> tuple[float, float, float, float] | None:
+    """Return finite collision-course bounds as ``xmin, xmax, ymin, ymax``.
+
+    Flat ground is intentionally unlimited.  Other tasks return their actual
+    MuJoCo collision surface, not an arbitrary camera framing rectangle.
+    """
+    validate_terrain_task(task)
+    if task in ("slope_up", "slope_down"):
+        return (
+            SLOPE_START_X_M,
+            SLOPE_START_X_M + SLOPE_LENGTH_M,
+            -SLOPE_HALF_WIDTH_M,
+            SLOPE_HALF_WIDTH_M,
+        )
+    if task == "rough":
+        return (
+            ROUGH_START_X_M,
+            ROUGH_START_X_M + ROUGH_TILE_COUNT_X * ROUGH_TILE_LENGTH_M,
+            ROUGH_START_Y_M,
+            ROUGH_START_Y_M + ROUGH_TILE_COUNT_Y * ROUGH_TILE_WIDTH_M,
+        )
+    return None
+
+
+def terrain_edge_clearance_m(task: str, x_m: float, y_m: float) -> float:
+    """Return signed distance to the nearest finite course edge in metres.
+
+    Positive is inside, zero is on an edge, and negative is outside.  Flat
+    ground has infinite clearance because it has no finite course boundary.
+    """
+    bounds = terrain_course_bounds(task)
+    if bounds is None:
+        return float("inf")
+    xmin, xmax, ymin, ymax = bounds
+    return float(min(x_m - xmin, xmax - x_m, y_m - ymin, ymax - y_m))
+
+
 def terrain_display_name(task: str, level: int | None = None) -> str:
     validate_terrain_task(task)
     if task == "slope_up":
