@@ -51,7 +51,13 @@ def follow_camera(environment: Go2BackQrLandingEnv) -> mujoco.MjvCamera:
     camera = mujoco.MjvCamera()
     mujoco.mjv_defaultCamera(camera)
     camera.type = mujoco.mjtCamera.mjCAMERA_FREE
-    camera.lookat[:] = 0.55 * drone + 0.30 * pad + 0.15 * environment.base_position
+    if environment.terrain_task == "rough":
+        # This is the wide observer used in the rough-terrain X500 inset.
+        # It keeps the full airframe inside the verified viewport throughout
+        # the initial search while the main view tracks the Go2 feet.
+        camera.lookat[:] = 0.35 * drone + 0.25 * pad + 0.40 * environment.base_position
+    else:
+        camera.lookat[:] = 0.55 * drone + 0.30 * pad + 0.15 * environment.base_position
     # Close enough to resolve the four landing feet and dorsal bridge while
     # retaining the full Go2 gait in the same third-person frame.
     # Keep *both* vehicles in shot from the initial 2–7 m annulus, then
@@ -62,15 +68,49 @@ def follow_camera(environment: Go2BackQrLandingEnv) -> mujoco.MjvCamera:
     # deck.  Expand only that wide-search view so the whole airframe remains
     # safely inside frame; the 2.72 m touchdown minimum keeps the requested
     # close third-person landing view once it has approached the pad.
-    if environment.terrain_task != "flat":
+    if environment.terrain_task == "rough":
+        # The terrain-centred target is lower than the generic airframe target.
+        # Add explicit headroom so the full X500 silhouette remains safely
+        # inside the verified third-person viewport during QR search.
+        camera.distance = max(3.35, 1.10 * separation + 2.65)
+    elif environment.terrain_task != "flat":
         camera.distance = max(2.72, 1.10 * separation + 1.75)
     else:
         camera.distance = max(2.72, 0.95 * separation + 1.57)
-    camera.azimuth = heading + 145.0
+    # Look across rough terrain rather than straight along it.  The side
+    # component reveals the real hfield profile in silhouette; a forward-only
+    # view projects almost all height changes into depth and reads as flat.
+    camera.azimuth = heading + (108.0 if environment.terrain_task == "rough" else 145.0)
     # Lower oblique angle makes the diagonal foot sequence readable; the
     # distance rule above still expands automatically to keep both vehicles
     # visible from the full 2--7 m starting annulus.
-    camera.elevation = -20.0
+    # A slightly lower side-oblique viewpoint exposes height silhouettes and
+    # shadows on the rough hfield instead of making it read as a flat mat.
+    camera.elevation = -8.0 if environment.terrain_task == "rough" else -20.0
+    return camera
+
+
+def terrain_detail_camera(environment: Go2BackQrLandingEnv) -> mujoco.MjvCamera:
+    """Close third-person observer for actual Go2 foot/terrain contact.
+
+    A single wide camera is necessary to show the initially remote X500, but
+    it hides centimetre-scale heightfield relief.  Rough recordings therefore
+    use this close, low observer as the main third-person panel and retain the
+    synchronized wide observer as an X500 picture-in-picture.
+    """
+    camera = mujoco.MjvCamera()
+    mujoco.mjv_defaultCamera(camera)
+    camera.type = mujoco.mjtCamera.mjCAMERA_FREE
+    base = environment.base_position
+    pad = environment.pad_position
+    rotation = environment.data.xmat[environment.base_id].reshape(3, 3)
+    heading = float(np.degrees(np.arctan2(rotation[1, 0], rotation[0, 0])))
+    camera.lookat[:] = 0.72 * base + 0.28 * pad
+    camera.distance = 3.15
+    camera.azimuth = heading + 126.0
+    # Grazing incidence makes the real centimetre-scale rises and dips read as
+    # a surface profile without changing the physical hfield height at all.
+    camera.elevation = -3.5
     return camera
 
 
@@ -242,6 +282,22 @@ def draw_drone_locator(
     label_y = y0 - 8 if y0 >= 28 else min(frame.shape[0] - 8, y1 + 21)
     cv2.putText(image, "X500", (x0, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, (3, 7, 12), 3, cv2.LINE_AA)
     cv2.putText(image, "X500", (x0, label_y), cv2.FONT_HERSHEY_SIMPLEX, 0.48, colour, 1, cv2.LINE_AA)
+    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+
+
+def compose_rough_terrain_third_person(detail: np.ndarray, wide: np.ndarray) -> np.ndarray:
+    """Add a synchronized wide X500 third-person inset to the terrain close-up."""
+    if detail.shape != (720, 1280, 3) or wide.shape != (720, 1280, 3):
+        raise ValueError("rough third-person views must both be 1280x720 RGB")
+    inset_width, inset_height = 344, 194
+    x0, y0 = detail.shape[1] - inset_width - 18, 176
+    image = cv2.cvtColor(detail, cv2.COLOR_RGB2BGR)
+    inset = cv2.resize(cv2.cvtColor(wide, cv2.COLOR_RGB2BGR), (inset_width, inset_height), interpolation=cv2.INTER_AREA)
+    cv2.rectangle(image, (x0 - 4, y0 - 26), (x0 + inset_width + 4, y0 + inset_height + 4), (8, 13, 19), -1)
+    image[y0:y0 + inset_height, x0:x0 + inset_width] = inset
+    cv2.rectangle(image, (x0 - 2, y0 - 2), (x0 + inset_width + 2, y0 + inset_height + 2), (55, 235, 255), 2, cv2.LINE_AA)
+    cv2.putText(image, "WIDE 3RD VIEW | X500", (x0, y0 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (3, 7, 12), 3, cv2.LINE_AA)
+    cv2.putText(image, "WIDE 3RD VIEW | X500", (x0, y0 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (235, 247, 255), 1, cv2.LINE_AA)
     return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
 
@@ -462,17 +518,17 @@ def main() -> None:
             go2_speed = float(np.linalg.norm(current.data.qvel[:2]))
             go2_tilt = float(np.degrees(np.arccos(np.clip(current.data.xmat[current.base_id, 8], -1.0, 1.0))))
             synchronized_state = render_state_fingerprint(current)
-            third_person_camera = follow_camera(current)
-            renderer.update_scene(current.data, camera=third_person_camera)
-            third_rgb = renderer.render().copy()
+            wide_third_person_camera = follow_camera(current)
+            renderer.update_scene(current.data, camera=wide_third_person_camera)
+            wide_third_rgb = renderer.render().copy()
             projected_x, projected_y, projection_depth = project_world_point(
                 renderer,
                 current.drone_position,
-                frame_width=third_rgb.shape[1],
-                frame_height=third_rgb.shape[0],
+                frame_width=wide_third_rgb.shape[1],
+                frame_height=wide_third_rgb.shape[0],
             )
             assert_render_state_unchanged(
-                current, synchronized_state, rendered_view="third-person RGB"
+                current, synchronized_state, rendered_view="wide third-person RGB"
             )
             visibility_sampled = (
                 last_drone_segmentation is None
@@ -507,14 +563,26 @@ def main() -> None:
                 third_person_drone_pixels = last_drone_pixels
             assert last_drone_box_size is not None and last_drone_projection_depth is not None
             projection_scale = last_drone_projection_depth / projection_depth
-            third = draw_drone_locator(
-                third_rgb,
+            wide_third = draw_drone_locator(
+                wide_third_rgb,
                 center=(projected_x, projected_y),
                 box_size=(
                     last_drone_box_size[0] * projection_scale,
                     last_drone_box_size[1] * projection_scale,
                 ),
             )
+            if current.terrain_task == "rough":
+                renderer.update_scene(current.data, camera=terrain_detail_camera(current))
+                terrain_detail = renderer.render().copy()
+                assert_render_state_unchanged(
+                    current, synchronized_state, rendered_view="rough terrain close third-person RGB"
+                )
+                # The main frame now resolves Go2 feet and the hfield while
+                # the validated full-airframe observer stays synchronized in
+                # the inset.  No second simulation step occurs between them.
+                third = compose_rough_terrain_third_person(terrain_detail, wide_third)
+            else:
+                third = wide_third
             third = draw_third_person_hud(
                 third, time_s=float(current.data.time), error=error, altitude=altitude,
                 path_distance=float(current._path_length), contacts=contacts, go2_speed=go2_speed,

@@ -217,8 +217,9 @@ def _annulus_ring_xml(radius_m: float, rgba: str, *, segments: int = 72) -> str:
 
 def _world_xml(terrain_task: str) -> str:
     return f"""
-    <light name="key" pos="-4 -4 8" dir=".35 .35 -1" directional="true" diffuse=".95 .95 1"/>
-    <light name="fill" pos="6 2 5" dir="-1 -.2 -.8" directional="true" diffuse=".35 .45 .65"/>
+    <light name="key" pos="-4 -4 8" dir=".35 .35 -1" directional="true" castshadow="true" diffuse=".95 .90 .76" specular=".24 .24 .20"/>
+    <light name="fill" pos="6 2 5" dir="-1 -.2 -.8" directional="true" castshadow="true" diffuse=".24 .34 .46" specular=".08 .10 .13"/>
+    <light name="terrain_rim" pos="8 -6 4" dir="-1 .55 -.55" directional="true" castshadow="true" diffuse=".34 .48 .28" specular=".16 .20 .12"/>
     <geom name="ground" type="plane" size="32 32 .1" rgba=".09 .16 .22 1" friction=".75 .020 .001" condim="3"/>
     <geom name="path_lane" type="box" pos="5 0 .001" size="9 .70 .002" rgba=".12 .48 .62 .20" contype="0" conaffinity="0"/>
     {_annulus_ring_xml(2.0, '.15 .65 1.0 .78')}

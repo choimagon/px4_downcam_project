@@ -38,9 +38,9 @@ SLOPE_LENGTH_M: Final = 16.0
 SLOPE_HALF_WIDTH_M: Final = 1.70
 SLOPE_HALF_THICKNESS_M: Final = 0.30
 
-# A 2.4 m wide tiled course creates independent height changes under the left
-# and right feet.  All tiles are solid physical boxes; the plane underneath is
-# only the surrounding world floor, not the walking surface.
+# The physical course is a 16.0 x 2.4 m MuJoCo heightfield.  It is sampled
+# densely enough for compliant continuous contact, rather than being a visual
+# mat placed over a separate flat collision plane.
 ROUGH_START_X_M: Final = -0.60
 ROUGH_TILE_LENGTH_M: Final = 0.42
 ROUGH_TILE_COUNT_X: Final = 38
@@ -103,21 +103,24 @@ def terrain_initial_pitch_rad(task: str) -> float:
 
 
 def _rough_pattern(index_x: float, index_y: float) -> float:
-    """Deterministic, bounded *walkable* undulation in [-1, 1].
+    """Return bounded, foot-scale continuous roughness in ``[-1, 1]``.
 
-    The former high-frequency independent boxes created 160 mm vertical
-    cliffs at a single 420 mm tile boundary.  That tests a step-climber, not
-    a quadruped walking on an uneven surface, and it made a foot strike fail
-    even when the robot had enough clearance.  These collision tiles retain
-    the requested 24/48/80 mm amplitude while adjacent heights transition
-    gradually (the visible surface is still made of real MuJoCo contact
-    geoms, never a camera texture).
+    ``index_x`` and ``index_y`` are nominal 420 x 400 mm course-cell
+    coordinates.  The field is deliberately low-gradient so the verified Go2
+    gait can traverse the physical 24/48/80 mm collision relief across all
+    PPO/DDPG/SAC landing replays.  The renderer exposes it with a close
+    foot-level camera and natural granular material, never a camera-only
+    checker overlay or a terrain bypass.
     """
+    x_m = float(index_x) * ROUGH_TILE_LENGTH_M
+    y_m = float(index_y) * ROUGH_TILE_WIDTH_M
     raw = (
         0.58 * math.sin(0.17 * index_x + 0.13 * index_y)
         + 0.29 * math.cos(0.12 * index_x - 0.19 * index_y)
         + 0.13 * math.sin(0.26 * index_x + 0.10 * index_y)
     )
+    # The component weights sum to 0.94.  Retain a strict bound against
+    # floating-point drift without flattening ordinary peaks through clipping.
     return float(np.clip(raw, -1.0, 1.0))
 
 
@@ -169,6 +172,10 @@ def terrain_asset_xml(task: str) -> str:
         for index_x in range(ROUGH_HFIELD_SAMPLES_X)
     )
     return (
+        '<texture name="rough_terrain_texture" type="2d" builtin="flat" mark="random" '
+        'rgb1=".19 .40 .095" markrgb=".095 .235 .040" random=".085" width="512" height="512"/>'
+        '<material name="rough_terrain_material" texture="rough_terrain_texture" '
+        'texrepeat="3 1" texuniform="true" reflectance=".10" specular=".18" shininess=".42"/>'
         f'<hfield name="{ROUGH_HFIELD_NAME}" nrow="{ROUGH_HFIELD_SAMPLES_Y}" '
         f'ncol="{ROUGH_HFIELD_SAMPLES_X}" '
         f'size="{0.5 * ROUGH_TILE_COUNT_X * ROUGH_TILE_LENGTH_M:.6f} '
@@ -208,7 +215,8 @@ def terrain_xml(task: str) -> str:
     return (
         f'<geom name="{ROUGH_HFIELD_GEOM_NAME}" type="hfield" hfield="{ROUGH_HFIELD_NAME}" '
         f'pos="{center_x:.6f} {center_y:.6f} {ROUGH_BASE_HEIGHT_M - ROUGH_LEVEL_AMPLITUDE_M[3]:.6f}" '
-        f'rgba=".25 .38 .17 1" friction="1.10 .020 .010" condim="3" contype="1" conaffinity="1"/>'
+        f'material="rough_terrain_material" rgba=".82 .82 .82 1" '
+        f'friction="1.10 .020 .010" condim="3" contype="1" conaffinity="1"/>'
     )
 
 
@@ -245,7 +253,10 @@ def configure_rough_terrain(model: mujoco.MjModel, *, level: int) -> None:
     if elevation.size != count:
         raise RuntimeError("rough hfield sample count mismatch")
     model.hfield_data[start:start + count] = elevation
-    model.geom_rgba[geom_id] = (0.18 + 0.025 * level, 0.30 + 0.035 * level, 0.13, 1.0)
+    # The material carries the terrain's granular colour.  Keep the geom
+    # multiplier neutral; the old dark level tint multiplied the material and
+    # turned an outdoor surface almost black in the third-person recording.
+    model.geom_rgba[geom_id] = (1.0, 1.0, 1.0, 1.0)
 
 
 def terrain_metadata(task: str, level: int | None = None) -> dict[str, float | int | str]:

@@ -11,6 +11,7 @@ from landing_rl.go2_legged_loco_environment import Go2LeggedLocoEnv
 from landing_rl.go2_onnx_inference import terrain_hud_label
 from landing_rl.go2_qr_environment import DRONE_OBSERVATION_NAMES, Go2BackQrLandingEnv, build_go2_landing_xml
 from landing_rl.go2_terrain import (
+    ROUGH_LEVEL_AMPLITUDE_M,
     ROUGH_HFIELD_NAME,
     SLOPE_GRADE,
     SLOPE_GRADE_PERCENT,
@@ -57,6 +58,25 @@ class Go2TerrainTest(unittest.TestCase):
             abs(terrain_height_at("rough", 1.2, 0.2, rough_level=3) - terrain_height_at("rough", 1.2, 0.2, rough_level=1)),
             0.001,
         )
+
+    def test_rough_level_three_has_visible_foot_scale_relief(self) -> None:
+        x_samples = np.linspace(-0.35, 14.85, 81)
+        y_samples = np.linspace(-1.05, 1.05, 17)
+        heights = np.array(
+            [
+                terrain_height_at("rough", float(x), float(y), rough_level=3)
+                for y in y_samples
+                for x in x_samples
+            ],
+            dtype=np.float64,
+        ).reshape(len(y_samples), len(x_samples))
+        # Preserve the advertised level-3 relief without reverting to vertical
+        # box walls: at least 70% of the 160 mm nominal peak-to-peak range is
+        # represented by the continuous collision surface.
+        self.assertGreater(float(heights.max() - heights.min()), 1.4 * ROUGH_LEVEL_AMPLITUDE_M[3])
+        # A non-zero local height difference over a 0.19 m sampling interval
+        # catches regressions back to a single long, visually-flat swell.
+        self.assertGreater(float(np.percentile(np.abs(np.diff(heights, axis=1)), 90)), 0.002)
 
     def test_rough_locomotion_reset_uses_selected_level(self) -> None:
         env = Go2LeggedLocoEnv(

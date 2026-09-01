@@ -216,7 +216,7 @@ def main() -> None:
         report = {
             "status": "passed",
             "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-            "description": "Physical MuJoCo 10%-grade (5.71-degree) uphill/downhill and 24/48/80mm continuous rough-terrain QR landing suite. Every published fixed-seed replay passes Go2 fall=0, Go2 peak tilt<=40deg, physical two-skid landing contact, zero Go2 root wrench, and synchronized third-person/down-camera recording.",
+            "description": "Physical MuJoCo 10%-grade (5.71-degree) uphill/downhill and 24/48/80mm continuous rough-terrain QR landing suite. Every published fixed-seed replay passes Go2 fall=0, Go2 peak tilt<=40deg, physical two-skid landing contact, zero Go2 root wrench, and synchronized close third-person/wide-X500 inset/down-camera recording.",
             "algorithms": list(ALGORITHMS),
             "scenarios": scenario_records,
             "demonstrations": records,
