@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<CycloneDDS xmlns="https://cdds.io/config">
+  <Domain id="any">
+    <General>
+      <!-- Fragment high-resolution camera frames safely over localhost UDP. -->
+      <MaxMessageSize>65500B</MaxMessageSize>
+    </General>
+    <Internal>
+      <!-- The launcher verifies the matching 8 MiB host socket limits. -->
+      <SocketReceiveBufferSize min="4MB" max="8MB" />
+      <SocketSendBufferSize min="4MB" max="8MB" />
+    </Internal>
+  </Domain>
+</CycloneDDS>

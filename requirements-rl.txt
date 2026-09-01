@@ -1,0 +1,11 @@
+gymnasium==0.29.1
+stable-baselines3==2.3.2
+matplotlib>=3.9
+mujoco==3.12.0
+onnx==1.19.1
+onnxruntime==1.23.2
+imageio==2.37.3
+imageio-ffmpeg==0.6.0
+trimesh==4.11.5
+pycollada==0.9.2
+scipy==1.15.3

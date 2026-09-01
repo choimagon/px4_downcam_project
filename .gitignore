@@ -1,0 +1,26 @@
+# Python build/test by-products
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+
+# Local simulation installations and vendor checkouts.  Bootstrap these from
+# their upstream repositories; they are far too large to vendor in this repo.
+PX4-Autopilot/
+third_party/
+
+# Reproducible but large run outputs and trained weights
+artifacts/
+models/
+logs/
+
+# Local server/process files
+*.pid
+*.lock
+*.log
+
+# Editor and operating-system state
+.vscode/
+.idea/
+.DS_Store

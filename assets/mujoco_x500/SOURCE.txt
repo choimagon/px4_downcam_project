@@ -1,0 +1,2 @@
+Converted from PX4-Autopilot/Tools/simulation/gz/models/x500_base/meshes/
+The original SDF is x500_mono_cam_down -> x500 -> x500_base plus mono_cam.
