@@ -192,6 +192,10 @@ TRACKING_MEMORY_S = 0.40
 # fine correction during approach.
 LANDING_POLICY_RESIDUAL_SPEED_MPS = 0.001
 LANDING_POLICY_TRAINING_RESIDUAL_SPEED_MPS = 0.002
+# The PX4 HIL full-3D policy is still bounded by a camera-only reference
+# governor, but unlike the legacy 2D trim it contributes to all velocity axes.
+FULL_3D_POLICY_HORIZONTAL_RESIDUAL_SPEED_MPS = 0.20
+FULL_3D_POLICY_VERTICAL_RESIDUAL_SPEED_MPS = 0.22
 LANDING_POLICY_RESIDUAL_CUTOFF_HEIGHT_M = 0.45
 LANDING_POLICY_RESIDUAL_FULL_HEIGHT_M = 1.20
 FINAL_BLIND_DESCENT_SPEED_MPS = 0.16
@@ -439,6 +443,9 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         terrain_task: str = "flat",
         rough_level: int | None = None,
         policy_residual_speed_mps: float = LANDING_POLICY_RESIDUAL_SPEED_MPS,
+        full_3d_policy_control: bool = False,
+        full_3d_horizontal_residual_speed_mps: float = FULL_3D_POLICY_HORIZONTAL_RESIDUAL_SPEED_MPS,
+        full_3d_vertical_residual_speed_mps: float = FULL_3D_POLICY_VERTICAL_RESIDUAL_SPEED_MPS,
     ) -> None:
         super().__init__()
         if difficulty not in GO2_PROFILES:
@@ -451,8 +458,15 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self._requested_rough_level = validate_rough_level(rough_level) if rough_level is not None else None
         self._active_rough_level = self._requested_rough_level or 2
         self.policy_residual_speed_mps = float(policy_residual_speed_mps)
+        self.full_3d_policy_control = bool(full_3d_policy_control)
+        self.full_3d_horizontal_residual_speed_mps = float(full_3d_horizontal_residual_speed_mps)
+        self.full_3d_vertical_residual_speed_mps = float(full_3d_vertical_residual_speed_mps)
         if not 0.0 <= self.policy_residual_speed_mps <= 0.01:
             raise ValueError("policy_residual_speed_mps must be within [0, 0.01]")
+        if not 0.0 <= self.full_3d_horizontal_residual_speed_mps <= 0.50:
+            raise ValueError("full_3d_horizontal_residual_speed_mps must be within [0, 0.50]")
+        if not 0.0 <= self.full_3d_vertical_residual_speed_mps <= 0.35:
+            raise ValueError("full_3d_vertical_residual_speed_mps must be within [0, 0.35]")
         self.model = mujoco.MjModel.from_xml_string(build_go2_landing_xml(terrain_task=self.terrain_task))
         self.data = mujoco.MjData(self.model)
         self.base_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "base_link")
@@ -507,7 +521,12 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self.dt = self.physics_steps * float(self.model.opt.timestep)
         self.max_steps = int(self.profile["max_steps"])
         self.observation_space = spaces.Box(low=-1.0, high=1.0, shape=(7,), dtype=np.float32)
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(2,), dtype=np.float32)
+        self.action_space = spaces.Box(
+            low=-1.0,
+            high=1.0,
+            shape=(3 if self.full_3d_policy_control else 2,),
+            dtype=np.float32,
+        )
         self._step_count = 0
         self._aligned_streak = 0
         self._landing_committed = False
@@ -1164,7 +1183,7 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
                     1.0,
                 )
             )
-            raw_action_world = drone_rotation[:2, :2] @ action
+            raw_action_world = drone_rotation[:2, :2] @ action[:2]
             if horizontal_error > 1.0e-6:
                 inward_direction = relative_world[:2] / horizontal_error
                 inward_component = max(
@@ -1172,7 +1191,11 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
                     float(raw_action_world @ inward_direction),
                 )
                 action_world = (
-                    self.policy_residual_speed_mps
+                    (
+                        self.full_3d_horizontal_residual_speed_mps
+                        if self.full_3d_policy_control
+                        else self.policy_residual_speed_mps
+                    )
                     * residual_envelope
                     * inward_component
                     * inward_direction
@@ -1277,6 +1300,38 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             if horizontal_error < 0.025 and relative_height > FINAL_PRECISION_TARGET_HEIGHT_M + 0.045:
                 self._approach_recovery = False
                 relative_vertical_velocity = -0.12
+        if (
+            self.full_3d_policy_control
+            and self._landing_committed
+            and not self._landing_retry_active
+            and not self._approach_recovery
+            and not self._imu_impact_latched
+        ):
+            # The full-3D policy contributes the commanded vertical velocity
+            # as well as XY.  It is deliberately a bounded residual around a
+            # camera/PnP nominal descent: this preserves the sensor-only
+            # touchdown guard while giving PPO/DDPG/SAC authority to slow,
+            # hold, or accelerate every permitted part of the descent.
+            vertical_axis_world = float(
+                (drone_rotation @ np.array((0.0, 0.0, action[2]), dtype=np.float64))[2]
+            )
+            relative_vertical_velocity += (
+                self.full_3d_vertical_residual_speed_mps
+                * residual_envelope
+                * vertical_axis_world
+            )
+            # This is a reference governor, not a deterministic vertical
+            # command: never let a learned residual turn a calibrated final
+            # approach into a blind high-rate descent below the visible
+            # stock-skid envelope.
+            if relative_height <= FINAL_PRECISION_DESCENT_HEIGHT_M:
+                relative_vertical_velocity = float(
+                    np.clip(relative_vertical_velocity, -0.22, 0.12)
+                )
+            else:
+                relative_vertical_velocity = float(
+                    np.clip(relative_vertical_velocity, -0.85, 0.45)
+                )
         if tracking:
             desired_vertical_velocity = self._qr_target_velocity_world[2] + relative_vertical_velocity
         else:
@@ -1502,6 +1557,7 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
         self._step_count += 1
         self._touchdown_success_evidence = False
         previous_distance = float(np.linalg.norm(self._horizontal_error()))
+        previous_relative_altitude = self._relative_altitude()
         for physics_index in range(self.physics_steps):
             self._apply_go2_locomotion()
             self._drone_control(action, update_alignment=physics_index == 0)
@@ -1639,11 +1695,28 @@ class Go2BackQrLandingEnv(gym.Env[np.ndarray, np.ndarray]):
             or self._go2_motion_violation or self._go2_nonsole_terrain_contact_violation
         )
         truncated = self._step_count >= self.max_steps
-        # The deterministic camera servo already supplies the nominal
-        # correction.  Penalize unnecessary raw residual proposals strongly
-        # so off-policy actors learn to stay near zero instead of exploiting
-        # tiny timing changes in the moving-deck contact phase.
-        reward = 7.0 * (previous_distance - horizontal_distance) - 0.035 * horizontal_distance - 1.0 * float(np.square(action).sum())
+        # The legacy two-axis policy is intentionally a near-zero trim.  The
+        # full-3D contract instead learns useful vertical braking/descent in
+        # addition to horizontal tracking, so it receives a camera-relative
+        # descent-progress term only after visual alignment is committed.
+        if self.full_3d_policy_control:
+            aligned_descent = (
+                max(0.0, previous_relative_altitude - relative_altitude)
+                if self._landing_committed and horizontal_distance < 0.30
+                else 0.0
+            )
+            reward = (
+                7.0 * (previous_distance - horizontal_distance)
+                - 0.035 * horizontal_distance
+                + 2.0 * aligned_descent
+                - 0.06 * float(np.square(action).sum())
+            )
+        else:
+            reward = (
+                7.0 * (previous_distance - horizontal_distance)
+                - 0.035 * horizontal_distance
+                - 1.0 * float(np.square(action).sum())
+            )
         if horizontal_distance < 0.30:
             reward += 0.12
         # Do not shape the dense reward with a fictitious landing-leg sensor.

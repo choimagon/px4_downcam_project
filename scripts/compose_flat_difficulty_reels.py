@@ -67,9 +67,9 @@ def title_text(
     )
     if px4_hil:
         controller_line = (
-            "MPC는 카메라/PnP·PX4 EKF 속도로 8-step 수평 속도 비용을 최소화하며, 모터 PWM·직접 force는 쓰지 않음"
+            "MPC는 카메라/PnP·PX4 EKF 3축 속도로 8-step 3D 속도 비용을 최소화하며, 모터 PWM·직접 force는 쓰지 않음"
             if algorithm == "mpc"
-            else "학습 정책은 수평 미세 보정만 제안하며, 모터 PWM·직접 force는 정책이 쓰지 않음"
+            else "학습 정책은 [Δvx, Δvy, Δvz] 3축 보정만 제안하며, 모터 PWM·직접 force는 정책이 쓰지 않음"
         )
         return "\n".join(
             common

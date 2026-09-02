@@ -18,6 +18,8 @@ from stable_baselines3.common.utils import set_random_seed
 
 from .go2_qr_environment import (
     DRONE_OBSERVATION_NAMES,
+    FULL_3D_POLICY_HORIZONTAL_RESIDUAL_SPEED_MPS,
+    FULL_3D_POLICY_VERTICAL_RESIDUAL_SPEED_MPS,
     GO2_PROFILES,
     IMU_IMPACT_MAX_VISUAL_HEIGHT_M,
     IMU_SETTLE_THRUST_FRACTION,
@@ -134,10 +136,21 @@ def promote_model_set_atomically(
 
 
 def evaluate_landing(
-    model: Any, *, seed: int, episodes: int, difficulty: str, locomotion_model: Path
+    model: Any,
+    *,
+    seed: int,
+    episodes: int,
+    difficulty: str,
+    locomotion_model: Path,
+    full_3d_policy_control: bool,
 ) -> dict[str, float]:
     """Evaluate six primary metrics plus explicitly offline MuJoCo diagnostics."""
-    env = Go2BackQrLandingEnv(seed=seed, difficulty=difficulty, locomotion_model=locomotion_model)
+    env = Go2BackQrLandingEnv(
+        seed=seed,
+        difficulty=difficulty,
+        locomotion_model=locomotion_model,
+        full_3d_policy_control=full_3d_policy_control,
+    )
     rewards: list[float] = []
     terminal_errors: list[float] = []
     terminal_steps: list[float] = []
@@ -228,6 +241,11 @@ def parse_args() -> argparse.Namespace:
         default=Path("models/go2_legged_loco_ppo.zip"),
         help="MuJoCo PPO residual policy trained from the legged-loco Go2 task contract",
     )
+    parser.add_argument(
+        "--full-3d-policy-control",
+        action="store_true",
+        help="Train a 3D [lateral_x, lateral_y, vertical] PX4 companion residual policy.",
+    )
     return parser.parse_args()
 
 
@@ -284,6 +302,7 @@ def main() -> None:
                 for name, archive in expected_archives.items()
             )
             and previous_manifest.get("locomotion_model_sha256") == sha256_file(args.locomotion_model)
+            and bool(previous_manifest.get("full_3d_policy_control")) == bool(args.full_3d_policy_control)
         )
         if not provenance_ok:
             raise SystemExit(
@@ -309,6 +328,7 @@ def main() -> None:
                 episodes=args.eval_episodes,
                 difficulty="train",
                 locomotion_model=args.locomotion_model,
+                full_3d_policy_control=bool(args.full_3d_policy_control),
             )
             held_out = {}
         else:
@@ -318,6 +338,7 @@ def main() -> None:
                     difficulty="train",
                     locomotion_model=args.locomotion_model,
                     policy_residual_speed_mps=LANDING_POLICY_TRAINING_RESIDUAL_SPEED_MPS,
+                    full_3d_policy_control=bool(args.full_3d_policy_control),
                 )
             )
             model = make_model(name, environment, seed)
@@ -330,7 +351,12 @@ def main() -> None:
             # serialized deployment archive behaves differently after load.
             model = ALGORITHMS[name].load(candidate_path.with_suffix(".zip"), device="cpu")
             training = evaluate_landing(
-                model, seed=seed + 10_000, episodes=args.eval_episodes, difficulty="train", locomotion_model=args.locomotion_model
+                model,
+                seed=seed + 10_000,
+                episodes=args.eval_episodes,
+                difficulty="train",
+                locomotion_model=args.locomotion_model,
+                full_3d_policy_control=bool(args.full_3d_policy_control),
             )
             held_out = {}
         held_out.update({
@@ -340,6 +366,7 @@ def main() -> None:
                 episodes=args.eval_episodes,
                 difficulty=difficulty,
                 locomotion_model=args.locomotion_model,
+                full_3d_policy_control=bool(args.full_3d_policy_control),
             )
             for index, difficulty in enumerate(difficulties)
         })
@@ -455,6 +482,7 @@ def main() -> None:
         "locomotion_reference": "MuJoCo PPO residual retrained from yang-zj1026/legged-loco Go2 task contract; a_deploy=0.50*clip(a_PPO,-1,1), q_target=q_ref+0.18*a_deploy, 58% duty diagonal trot [0,0.5,0.5,0], 60/2 tracking PD, identically zero six-axis root wrench, foot-slip and body-height rewards",
         "locomotion_model": str(args.locomotion_model),
         "locomotion_model_sha256": sha256_file(args.locomotion_model),
+        "full_3d_policy_control": bool(args.full_3d_policy_control),
         "observation": "[qr_center_u, qr_center_v, qr_pnp_depth, qr_detected, qr_center_rate_u, qr_center_rate_v, drone_vertical_velocity]",
         "observation_names": DRONE_OBSERVATION_NAMES,
         "observation_formula": "[u_qr, v_qr, min(1,z_pnp/8), detected, clip(du_qr/dt/3), clip(dv_qr/dt/3), clip(vz_est/3)] in [-1,1]^7",
@@ -487,9 +515,19 @@ def main() -> None:
             "success_max_relative_height_m": SUCCESS_MAX_RELATIVE_HEIGHT_M,
         },
         "go2_action_contract": "a_deploy=0.50*clip(a_PPO,-1,1); q_target=q_ref+0.18*a_deploy; applied six-axis root wrench=0",
-        "action": "[lateral_x, lateral_y] proposal projected onto the inward camera QR-error direction only; training exploration envelope 0.002 m/s, held-out evaluation/deployment envelope 0.001 m/s, tapered below 1.20 m and zero inside 0.45 m; no target-state feed-forward",
+        "action": (
+            "[lateral_x, lateral_y, vertical] bounded 3D camera/PnP velocity residual; XY is projected onto the inward QR-error direction and Z is added to the permitted camera-relative descent; all three axes are tapered below 1.20 m and clipped by the final visual safety governor; no target-state feed-forward"
+            if args.full_3d_policy_control else
+            "[lateral_x, lateral_y] proposal projected onto the inward camera QR-error direction only; training exploration envelope 0.002 m/s, held-out evaluation/deployment envelope 0.001 m/s, tapered below 1.20 m and zero inside 0.45 m; no target-state feed-forward"
+        ),
         "training_policy_residual_speed_mps": LANDING_POLICY_TRAINING_RESIDUAL_SPEED_MPS,
         "deployment_policy_residual_speed_mps": LANDING_POLICY_RESIDUAL_SPEED_MPS,
+        "full_3d_horizontal_residual_speed_mps": (
+            FULL_3D_POLICY_HORIZONTAL_RESIDUAL_SPEED_MPS if args.full_3d_policy_control else None
+        ),
+        "full_3d_vertical_residual_speed_mps": (
+            FULL_3D_POLICY_VERTICAL_RESIDUAL_SPEED_MPS if args.full_3d_policy_control else None
+        ),
         "search": "while QR is absent, use only the declared forward-corridor mission waypoint, elapsed time and own 50 Hz PX4 position/altitude estimate for a lateral sweep; begin target tracking only after a 30 Hz camera detection",
         "imu_landing_controller": f"body-Z accelerometer minus known commanded body-Z specific force; impact gate 4.0 m/s^2 below {IMU_IMPACT_MAX_VISUAL_HEIGHT_M:.3f} m visual height and |vz_est|<=0.45 m/s; cut collective to {IMU_SETTLE_THRUST_FRACTION:.2f} of hover for the 0.35 s settle window instead of bouncing the leading skid, then climb at 0.45 m/s for visual reacquisition only if not settled; last-target memory is used only for a genuine detector dropout/brief occlusion because the down camera remains about {X500_NOMINAL_TOUCHDOWN_RELATIVE_HEIGHT_M - 0.065:.3f} m above the marker at stock-skid touchdown; no landing-leg/contact input",
         "start_distribution": "X500 begins uniformly at a random 2–7 m annulus position around the QR deck fixed to Go2 base_link",

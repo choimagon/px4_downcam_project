@@ -274,15 +274,15 @@ MuJoCo 학습 환경과 PX4 비행제어를 하나로 섞어 구현한 것이 �
 평가·영상 생성은 별도 실행되는 **프로젝트 내부 PX4 SITL 바이너리**와 MAVLink
 HIL로 연결한다.
 따라서 학습 정책이 모터 PWM을 직접 내지 않는다. 정책은 QR 추적용 제한된
-2D 수평 보정만 제안하고, PX4가 EKF2·속도/자세/고도 제어·제어할당·모터 네 개의
-출력을 계산한다.
+3D 속도 보정 `Δvx, Δvy, Δvz`를 제안하고, PX4가 EKF2·속도/자세/고도 제어·
+제어할당·모터 네 개의 출력을 계산한다.
 
 ```text
 MuJoCo X500 IMU / barometer / GPS
     └─ HIL_SENSOR + HIL_GPS (MAVLink) ────────────────► PX4 SITL EKF2
 
-QR/PnP + PX4 자체 상태 ─┬─► PPO/DDPG/SAC ONNX (2D 제한 residual)
-                          └─► camera/PnP MPC (8-step 속도 계획)
+QR/PnP + PX4 자체 상태 ─┬─► PPO/DDPG/SAC ONNX (3D 제한 residual)
+                          └─► camera/PnP MPC (8-step 3D 속도 계획)
                                        └─► companion velocity target
     └─ SET_POSITION_TARGET_LOCAL_NED (vx, vy, vz) ───► PX4 Offboard control
 
@@ -293,18 +293,22 @@ PX4 position/attitude control + control allocation
 ### 비학습 Camera/PnP MPC 기준선
 
 MPC는 PPO/DDPG/SAC와 별도로 비교하는 **비학습** 기준선이다. ONNX나 Go2 상태를
-읽지 않고, 하향 카메라/PnP에서 얻은 QR 대비 수평 위치·상대속도와 PX4 EKF2의
-드론 수평속도만 사용한다. 100 ms 간격, 8 step horizon에서 PX4 속도 루프를
-0.38 s 1차 응답으로 예측하고, 목표 대비 위치 오차(8.0)·상대속도(7.0)·명령
-변화(0.04)·종단 위치 오차(20.0)의 가중 비용이 가장 낮은 수평 속도 reference를
-선택한다. 9×9 후보 lattice와 3.6 m/s 속도 상한을 사용하며, 매 제어 주기에 첫
-명령만 내보내고 다시 푼다(receding horizon).
+읽지 않고, 하향 카메라/PnP에서 얻은 QR 대비 3D 위치·상대속도와 PX4 EKF2의
+드론 3D 속도만 사용한다. 100 ms 간격, 8 step horizon에서 PX4 수평/수직 속도
+루프를 각각 0.38/0.32 s 1차 응답으로 예측하고, 수평 위치 오차(28.0)·수직 위치
+오차(10.0)·수평 상대속도(1.5)·수직 상대속도(8.0)·명령 변화(0.04)·종단 위치
+오차(80.0/24.0)의 가중 비용이 가장 낮은 `vx, vy, vz` reference를 선택한다.
+5×5×3 후보 lattice, 수평 3.6 m/s·하강 0.65 m/s 상한을 사용하며, 매 100 ms
+첫 명령만 내보내고 다시 푼다(receding horizon). Z 목표는 QR 중심이 아니라 stock
+X500 스키드의 물리 접지 clearance이며, 그 높이보다 위에서는 최소 하강 후보 0.22 m/s를
+MPC feasible set에 넣는다. 이는 별도 수직 제어가 아니라 3D MPC의 물리 제약이다.
 
-MPC는 QR 상대고도 0.55 m보다 높은 접근 구간을 담당한다. 그 아래 최종 접촉
-구간은 PPO/DDPG/SAC와 같은 카메라/PnP 전용 정밀 착륙 safety layer를 공통으로
-사용한다. 이 층은 영상·시뮬레이터 정답·Go2 상태를 읽지 않으며, QR 중심 오차와
-상대 속도의 측정 gate로 하강/hold만 결정한다. 어떤 경우에도 MPC가 모터 PWM,
-force/torque, pose를 직접 출력하지 않고 PX4에는 Offboard `vx/vy/vz`만 보낸다.
+PPO/DDPG/SAC도 동일하게 7D 카메라/자체수직속도 입력에서 3D residual
+`Δvx, Δvy, Δvz`를 낸다. 이 3축 보정은 카메라/PnP 기준 reference에 합산된다.
+QR가 보이지 않거나 QR 중심·상대속도 gate를 통과하지 못하면 safety governor가
+하강만 hold한다. 이는 별도의 수직 제어기가 아니라, 잘못된 QR/접촉 추정에서
+하강을 금지하는 최후 제한이다. 어떤 경우에도 RL/MPC가 모터 PWM, force/torque,
+pose를 직접 출력하지 않고 PX4에는 Offboard `vx/vy/vz`만 보낸다.
 
 ### Gazebo PX4 X500에서 MuJoCo HIL로 옮긴 범위
 
@@ -340,6 +344,7 @@ allocation HIL 검증**이며, Gazebo 플러그인 또는 개별 로터 공력�
 cd PX4-Autopilot
 make px4_sitl_default
 cd ..
+bash scripts/train_px4_flat_hil_3d.sh
 python3 scripts/run_px4_flat_hil_suite.py
 python3 scripts/build_go2_back_qr_dashboard.py
 python3 -m http.server 9371 --bind 0.0.0.0 --directory artifacts/rl_training
@@ -539,7 +544,10 @@ $$
 
 ### X500 PPO/DDPG/SAC의 실제 입력·출력
 
-세 드론 정책은 서로 같은 `float32[7]`을 입력으로 받고 2D 수평 속도 잔차를 출력한다.
+세 드론 정책은 서로 같은 `float32[7]`을 입력으로 받고 3D 속도 잔차
+`[Δv_x, Δv_y, Δv_z]`를 출력한다. XY는 카메라/PnP 기반 기준 추적을 보정하고,
+Z는 가시 정렬이 성립한 하강 기준속도를 보정한다. 최종 접근의 시각 gate·속도 한계·충격
+복구는 정책 밖 safety governor가 맡으며, PX4가 최종 `vx/vy/vz`로 자세·collective·모터를 계산한다.
 
 | # | 입력 | 실제/시뮬레이터 획득 경로 | 가공 |
 | ---: | --- | --- | --- |
