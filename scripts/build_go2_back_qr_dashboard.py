@@ -320,8 +320,21 @@ def px4_flat_hil_suite_section() -> str:
         cards_by_algorithm.append(
             f'<details class="terrain-task" open><summary>{algorithm.upper()} · 평지 초급/중급/고급 실제 PX4 HIL 3개</summary><div class="video-grid">{"".join(cards)}</div></details>'
         )
+    reel_cards: list[str] = []
+    for algorithm in ALGORITHMS:
+        reel = f"px4_sitl_ekf2_{algorithm}_flat_easy_medium_hard_reel.mp4"
+        available = (ARTIFACTS / reel).is_file()
+        reel_cards.append(
+            f'''<section class="video-panel"><div class="video-title"><h3>{algorithm.upper()} · PX4 평지 초급 → 중급 → 고급 합본</h3><b class="{'ok' if available else 'wait'}">{'완료 · PX4 HIL 안내 보드 포함' if available else 'PX4 HIL 합본 생성 대기'}</b></div>
+<video controls preload="metadata"><source src="{reel}" type="video/mp4">MP4 재생을 지원하지 않습니다.</video>
+<p>각 단계 시작 보드에 <strong>PX4 SITL·EKF2·MAVLink HIL</strong>, QR/PnP 기반 Offboard <code>vx/vy/vz</code>, PX4 위치·자세 제어와 네 모터 할당을 명시했습니다. 이후에는 같은 실행의 3인칭과 하향 QR 카메라 동기화 화면을 재생합니다.</p><p class="links"><a href="{reel}">PX4 HIL 합본 MP4</a></p></section>'''
+        )
+    reel_section = (
+        '<details class="terrain-task" open><summary>PX4 SITL HIL · 초급/중급/고급 단계별 합본 3개</summary>'
+        '<div class="video-grid">' + "".join(reel_cards) + "</div></details>"
+    )
     status = "9/9 완료" if manifest.get("all_success") else "일부 실행 미완료"
-    return f'''<section class="section" id="px4-flat-hil-suite"><div class="section-kicker">FRESH RL TRAINING → REAL PX4 EKF2 HIL · 9 MP4</div><h2>PX4 평지 초급·중급·고급 — PPO·DDPG·SAC 재학습 배포 검증</h2><div class="callout"><strong>{status}.</strong> 세 정책은 동일 7D 카메라/자체수직속도 입력과 2D residual 출력을 MuJoCo에서 새로 학습한 뒤, 각 난이도에서 독립 PX4 SITL·EKF2·MAVLink HIL 프로세스로 실행했습니다. Go2는 별도의 학습된 12관절 저수준 PPO로 실제 발바닥 접지 보행하며, 영상 HUD와 표에서 실제 속도·이동거리·발바닥 접지 수를 확인할 수 있습니다. <strong>난이도 이동 설정:</strong> {route_summary}. 아래 MP4는 실제 PX4 모터 할당 경로의 배포 검증입니다.</div>{''.join(cards_by_algorithm)}<p class="links"><a href="px4_flat_hil_suite.json">전체 실행 manifest</a><a href="px4_flat_hil_training/px4_flat_hil_training_metrics.json">재학습 평가 JSON</a><a href="px4_flat_hil_onnx_models.json">ONNX 검증 manifest</a></p></section>'''
+    return f'''<section class="section" id="px4-flat-hil-suite"><div class="section-kicker">FRESH RL TRAINING → REAL PX4 EKF2 HIL · 9 MP4</div><h2>PX4 평지 초급·중급·고급 — PPO·DDPG·SAC 재학습 배포 검증</h2><div class="callout"><strong>{status}.</strong> 세 정책은 동일 7D 카메라/자체수직속도 입력과 2D residual 출력을 MuJoCo에서 새로 학습한 뒤, 각 난이도에서 독립 PX4 SITL·EKF2·MAVLink HIL 프로세스로 실행했습니다. Go2는 별도의 학습된 12관절 저수준 PPO로 실제 발바닥 접지 보행하며, 영상 HUD와 표에서 실제 속도·이동거리·발바닥 접지 수를 확인할 수 있습니다. <strong>난이도 이동 설정:</strong> {route_summary}. 아래 MP4는 실제 PX4 모터 할당 경로의 배포 검증입니다.</div>{''.join(cards_by_algorithm)}{reel_section}<p class="links"><a href="px4_flat_hil_suite.json">전체 실행 manifest</a><a href="px4_flat_hil_training/px4_flat_hil_training_metrics.json">재학습 평가 JSON</a><a href="px4_flat_hil_onnx_models.json">ONNX 검증 manifest</a></p></section>'''
 
 
 def main() -> None:
