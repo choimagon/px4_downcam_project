@@ -267,6 +267,96 @@ model per algorithm under `artifacts/rl_training/`, then builds
 never be pointed at a physical vehicle without independent safety review,
 flight-boundary validation, and a hardware kill path.
 
+## PX4 SITL + MuJoCo HIL 배포 검증 (현재 추론·영상 기준)
+
+MuJoCo 학습 환경과 PX4 비행제어를 하나로 섞어 구현한 것이 아니다.
+학습은 MuJoCo에서 수행하고, 최종 PPO/DDPG/SAC ONNX 추론·평가·영상 생성은
+별도 실행되는 **프로젝트 내부 PX4 SITL 바이너리**와 MAVLink HIL로 연결한다.
+따라서 학습 정책이 모터 PWM을 직접 내지 않는다. 정책은 QR 추적용 제한된
+2D 수평 보정만 제안하고, PX4가 EKF2·속도/자세/고도 제어·제어할당·모터 네 개의
+출력을 계산한다.
+
+```text
+MuJoCo X500 IMU / barometer / GPS
+    └─ HIL_SENSOR + HIL_GPS (MAVLink) ────────────────► PX4 SITL EKF2
+
+QR/PnP + PX4 자체 수직속도 → PPO/DDPG/SAC ONNX → companion velocity target
+    └─ SET_POSITION_TARGET_LOCAL_NED (vx, vy, vz) ───► PX4 Offboard control
+
+PX4 position/attitude control + control allocation
+    └─ HIL_ACTUATOR_CONTROLS (motor 0..3) ───────────► MuJoCo X500 physics
+```
+
+### Gazebo PX4 X500에서 MuJoCo HIL로 옮긴 범위
+
+이 경로는 Gazebo 전체를 MuJoCo로 변환해 PX4를 흉내 낸 것이 아니다. 기존
+PX4 Gazebo X500의 기체 프레임·질량/관성·스키드 형상·로터 위치와 회전 방향을
+MuJoCo 장면에 이식하고, 이미 빌드된
+`PX4-Autopilot/build/px4_sitl_default/bin/px4`를 별도 프로세스로 실행한다.
+각 실행은 X500 airframe `4001` 기반의 임시 PX4 rootfs를 만들고
+`simulator_mavlink`만 선택한다. 기존 Gazebo 프로세스, PX4 소스 트리, 사용자
+파라미터 파일은 수정하지 않는다.
+
+| 경계 | MuJoCo 쪽 | PX4 쪽 |
+| --- | --- | --- |
+| 좌표 | world NWU, body FLU | local NED, body FRD |
+| 센서 | 가속도계·자이로·자력계·기압·GPS | `HIL_SENSOR`, `HIL_GPS` 수신 후 EKF2 융합 |
+| 상위 명령 | 카메라/PnP 기반 `vx`, `vy`, `vz` 목표 | MAVLink Offboard local-velocity setpoint 수신 |
+| 저수준 | PX4가 낸 4개 모터 출력으로 힘/토크 계산 | multicopter 제어기와 X500 control allocation |
+| 착지 접촉 | Go2·QR 판·X500 스키드의 MuJoCo 충돌 | 접촉값을 입력으로 사용하지 않음 |
+
+MuJoCo는 PX4의 `HIL_ACTUATOR_CONTROLS` 네 출력을 X500의 실제 로터 위치,
+추력 방향, yaw moment ratio로 합산하여 기체의 force/torque에 적용한다. 이는
+정책이나 companion이 직접 비행 force, pose, velocity, PWM을 쓰는 경로가 아니다.
+단, 개별 로터의 공력/워시와 Gazebo 플러그인 물리는 MuJoCo에서 별도로 재현하지
+않는다. 그러므로 이 검증은 **PX4 EKF2·Offboard·multicopter control·control
+allocation HIL 검증**이며, Gazebo 플러그인 또는 개별 로터 공력의 동등성 검증은
+아니다.
+
+### 재현과 감사 산출물
+
+먼저 프로젝트 내부 PX4 SITL 바이너리가 필요하다.
+
+```bash
+cd PX4-Autopilot
+make px4_sitl_default
+cd ..
+python3 scripts/run_px4_flat_hil_suite.py
+python3 scripts/build_go2_back_qr_dashboard.py
+python3 -m http.server 9371 --bind 0.0.0.0 --directory artifacts/rl_training
+```
+
+`run_px4_flat_hil_suite.py`는 PPO/DDPG/SAC × 초급/중급/고급의 9개 독립 실행을
+만든다. 각 실행은 H.264 MP4, PNG, trace CSV, metrics JSON, PX4 텍스트 로그,
+ULog를 남기며 `artifacts/rl_training/px4_flat_hil_suite.json`에 통합된다.
+유효한 실행은 PX4 armed/Offboard 상태, HIL 센서·GPS·모터 메시지 수, EKF
+innovation, HIL 시간 단조성, Go2 발 접지/낙상, 그리고 양쪽 X500 스키드의 물리
+접촉을 함께 기록한다.
+
+### 실제 PX4 기체 연동 가능성 분석
+
+현재 구조는 실기 companion 구조와 같은 경계를 사용하므로, 실기 연결의 출발점으로
+사용할 수 있다. MuJoCo HIL에서 이미 검증하는 것은 실제 PX4의 EKF2 입력 경로,
+Offboard `vx/vy/vz` 명령, 자세/추력 계산, 모터 할당이다. 실기에서는 MuJoCo HIL
+송신부를 다음 입력 어댑터로 교체하면 된다.
+
+1. 하향 카메라의 QR corner 검출·camera calibration·`solvePnP`로 정책의
+   `float32[7]` 관측을 만든다.
+2. PX4 `vehicle_local_position`의 유효한 수직속도를 NED 부호에서 학습 좌표계로
+   변환한다.
+3. ONNX 출력을 같은 안전층으로 제한하고 MAVSDK/ROS 2 companion에서 Offboard
+   local-velocity setpoint만 보낸다.
+4. QR 미검출, 카메라/상태 timestamp 지연, Offboard loss에 대해 hold/상승/RTL과
+   독립 kill path를 둔다.
+5. 정지 QR 패드, tether/bench, 저속 이동 패드 순서로 검증한 뒤에만 Go2 이동
+   착륙을 시험한다.
+
+따라서 이 저장소의 결과는 실제 기체 비행 인증이나 안전 보증이 아니다. 특히 실제
+카메라 QR detector/solvePnP, 외부보정, 통신 지연, vibration, failsafe는 별도로
+구현·시험해야 한다. 그러나 정책이 raw motor를 우회하지 않고 PX4의 표준 Offboard
+속도 인터페이스를 사용하므로, 이 조건들을 충족하면 실제 PX4 기체 연동에 활용할 수
+있는 구조다.
+
 ## Unitree Go2 dorsal QR-deck landing
 
 `third_party/unitree_mujoco` contains a sparse checkout of Unitree's official

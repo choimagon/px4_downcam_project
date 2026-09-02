@@ -139,6 +139,21 @@ def video_panel(algorithm: str, difficulty: str, korean: str) -> str:
 <p class="links"><a href="{video}">MP4</a><a href="{snapshot}">PNG</a><a href="{log}">CSV</a></p></section>'''
 
 
+def flat_difficulty_reel_section() -> str:
+    """Render one concise stage-labelled flat-ground reel per policy."""
+    cards = []
+    for algorithm in ALGORITHMS:
+        video = f"{algorithm}_flat_easy_medium_hard_reel.mp4"
+        available = (ARTIFACTS / video).is_file()
+        cards.append(
+            f'''<section class="video-panel"><div class="video-title"><h3>{algorithm.upper()} · 평지 초급 → 중급 → 고급 합본</h3><b class="{'ok' if available else 'wait'}">{'완료 · 단계 안내 포함' if available else '합본 생성 대기'}</b></div>
+<video controls preload="metadata"><source src="{video}" type="video/mp4">MP4 재생을 지원하지 않습니다.</video>
+<p>각 단계 시작 전 약 3.8초 동안 <strong>난이도, Go2 목표 속도·회전 설정, X500의 하향 QR/PnP와 MuJoCo 기체 센서 상태추정 기반 착륙 방식</strong>을 표시합니다. 이는 실제 PX4 EKF2를 실행한 영상이 아닙니다. 이후 같은 시점의 3인칭 전체 화면과 하향 카메라 화면을 재생합니다.</p>
+<p class="links"><a href="{video}">합본 MP4</a></p></section>'''
+        )
+    return '''<section class="section" id="flat-difficulty-reels"><div class="section-kicker">FLAT-GROUND STAGE REELS · 3 MP4</div><h2>평지 초급·중급·고급 이어보기</h2><div class="callout">각 기법별로 <strong>초급 안내 → 초급 영상 → 중급 안내 → 중급 영상 → 고급 안내 → 고급 영상</strong> 순서로 하나의 MP4에 연결했습니다. 평지 이외의 자갈길 영상과 혼합하지 않았습니다.</div><div class="video-grid">''' + "".join(cards) + "</div></section>"
+
+
 def terrain_video_panel(record: dict) -> str:
     """Render one verified physical-terrain landing card from its manifest."""
     video = html.escape(str(record["video"]))
@@ -260,6 +275,55 @@ def algorithm_card(name: str, metrics: dict, onnx: dict) -> str:
 <details><summary><code>offline_sim_*</code> 물리 진단 보기 — 정책 센서가 아님</summary><div class="table-scroll"><table><thead><tr><th>분포</th><th>Go2 전도율</th><th>stock 스키드 레일-판 접촉</th><th>정상력</th><th>최대 침투</th><th>Go2 경로</th><th>데크 속도</th><th>Go2 속도</th><th>접지 미끄럼</th><th>몸통 높이</th><th>몸통 기울기</th><th>root wrench max |component|</th></tr></thead><tbody><tr><th>학습</th>{offline_evaluation_cells(policy.get('training', {}))}</tr>{offline_rows}</tbody></table></div></details></article>'''
 
 
+def px4_flat_hil_section() -> str:
+    """Explain the current PX4 HIL boundary without duplicating stale media."""
+    return '''<section class="section" id="px4-flat-hil"><div class="section-kicker">REAL PX4 SITL · EKF2 · MAVLINK HIL · FLAT ONLY</div><div class="algorithm-heading"><div><h2>분리 실행 PX4 EKF2 평지 착륙</h2><p>아래 9개 영상은 각각 독립 PX4 SITL 프로세스에서 재생성한 최신 결과입니다. MuJoCo는 센서·기체 물리·Go2/QR 접촉을 맡고, PX4는 실제 EKF2·멀티콥터 위치 제어·모터 할당을 수행합니다.</p></div><b class="ok">9/9 완료 · 실제 PX4 EKF2 HIL</b></div>
+<div class="split"><div class="formula-card"><h3>실제로 PX4에 들어간 값</h3><p>매 5 ms MuJoCo IMU(가속도·자이로·자력계), 기압, GPS 위치·속도를 <code>HIL_SENSOR</code>/<code>HIL_GPS</code>로 보냅니다. PX4 EKF2의 local position·velocity·attitude를 다시 받아 카메라 기반 임무의 드론 자체 상태로만 사용합니다. GPS/상태/명령 좌표는 MuJoCo NWU와 PX4 NED/FRD 사이에서 변환합니다.</p><p>각 PPO·DDPG·SAC ONNX는 QR/PnP 6개와 PX4 수직속도 1개의 <code>float32[7]</code>만 받고, 2D 제한 residual을 냅니다. Go2 위치·속도, QR 월드 정답, 접촉값은 정책 입력이나 PX4 명령에 넣지 않습니다.</p></div><div class="formula-card"><h3>PX4가 실제로 한 일</h3><p>Offboard local-velocity setpoint를 수신한 PX4 multicopter 위치제어기가 자세·collective를 계산하고, 반환된 <code>HIL_ACTUATOR_CONTROLS</code> 네 값만 X500의 MuJoCo 추력/토크로 변환합니다. 직접 비행 wrench, 직접 pose/velocity 이동, 외부 모터 명령은 사용하지 않습니다.</p><p>최신 각 실행의 EKF innovation, HIL 메시지 수, trace CSV와 ULog는 아래 9개 카드에서 각각 확인할 수 있습니다.</p></div></div>
+<p class="offline-note"><strong>범위:</strong> 실제 비행 하드웨어가 아니라, 기존 Gazebo를 실행하지 않는 격리된 <strong>PX4 SITL + MuJoCo HIL</strong> 평지 검증입니다. 실제 EKF2·PX4 모터 제어 경로는 검증했지만 카메라 RGB decoder/solvePnP 하드웨어 어댑터는 아직 연결하지 않았습니다.</p><p class="links"><a href="#px4-flat-hil-suite">최신 9개 PX4 HIL MP4와 지표로 이동</a></p></section>'''
+
+
+def px4_flat_hil_suite_section() -> str:
+    """Render the fresh-model nine-run PX4 flat deployment suite."""
+    manifest_file = ARTIFACTS / "px4_flat_hil_suite.json"
+    manifest = read_json(manifest_file)
+    records = [item for item in manifest.get("records", []) if isinstance(item, dict)]
+    if not records:
+        return '''<section class="section" id="px4-flat-hil-suite"><div class="section-kicker">PX4 FLAT STAGE SUITE · PPO/DDPG/SAC</div><h2>PX4 평지 초급·중급·고급 재학습 검증</h2><div class="callout">PPO·DDPG·SAC 재학습 및 실제 PX4 EKF2 HIL 9개 재생을 준비 중입니다.</div></section>'''
+    route_summaries: list[str] = []
+    for difficulty, korean in DIFFICULTIES:
+        representative = next((item for item in records if item.get("algorithm") == "ppo" and item.get("difficulty") == difficulty), {})
+        route = representative.get("go2_route", {}) if isinstance(representative.get("go2_route"), dict) else {}
+        route_summaries.append(
+            f"{korean}: 명령 {fmt(route.get('command_speed_mps'), 2, ' m/s')}, "
+            f"출발 지연 {fmt(route.get('motion_start_delay_s'), 1, ' s')}, "
+            f"회전 진폭 {fmt(route.get('turn_angle_rad'), 3, ' rad')}"
+        )
+    route_summary = html.escape(" · ".join(route_summaries))
+    cards_by_algorithm: list[str] = []
+    for algorithm in ALGORITHMS:
+        cards: list[str] = []
+        for difficulty, korean in DIFFICULTIES:
+            record = next((item for item in records if item.get("algorithm") == algorithm and item.get("difficulty") == difficulty), {})
+            terminal = record.get("terminal", {}) if isinstance(record.get("terminal"), dict) else {}
+            px4 = record.get("px4", {}) if isinstance(record.get("px4"), dict) else {}
+            required = tuple(str(record.get(key, "")) for key in ("video", "snapshot", "metrics", "trace", "px4_log", "ulog"))
+            available = bool(record.get("success")) and all(name and (ARTIFACTS / name).is_file() for name in required)
+            video = html.escape(str(record.get("video", "")))
+            snapshot = html.escape(str(record.get("snapshot", "")))
+            metrics = html.escape(str(record.get("metrics", "")))
+            trace = html.escape(str(record.get("trace", "")))
+            ulog = html.escape(str(record.get("ulog", "")))
+            cards.append(f'''<section class="video-panel"><div class="video-title"><h3>{korean} <span>({difficulty})</span></h3><b class="{'ok' if available else 'wait'}">{'완료 · PX4 EKF2 HIL' if available else '미완료'}</b></div>
+<video controls preload="metadata"><source src="{video}" type="video/mp4">MP4 재생을 지원하지 않습니다.</video><a class="shot" href="{snapshot}"><img src="{snapshot}" alt="{algorithm.upper()} {korean} 실제 PX4 HIL 평지 착륙"><span>3인칭과 하향 QR 카메라 동기화</span></a>
+<div class="table-scroll"><table class="live"><thead><tr><th>종단 QR 오차</th><th>상대고도</th><th>Go2 실제 속도</th><th>Go2 이동거리</th><th>발바닥 접지</th><th>스키드</th><th>EKF XY/Z innovation</th></tr></thead><tbody><tr><td>{fmt(terminal.get('horizontal_error_m'), 4, ' m')}</td><td>{fmt(terminal.get('altitude_m'), 3, ' m')}</td><td>{fmt(terminal.get('go2_speed_mps'), 3, ' m/s')}</td><td>{fmt(terminal.get('go2_path_distance_m'), 3, ' m')}</td><td>{fmt(terminal.get('offline_sim_go2_sole_contacts'), 0, ' / 4')}</td><td>{fmt(terminal.get('offline_sim_landing_skid_contacts'), 0, ' / 2')}</td><td>{fmt(px4.get('ekf_xy_innovation_ratio'), 4)} / {fmt(px4.get('ekf_z_innovation_ratio'), 4)}</td></tr></tbody></table></div>
+<p class="links"><a href="{video}">MP4</a><a href="{snapshot}">PNG</a><a href="{metrics}">평가 JSON</a><a href="{trace}">trace CSV</a><a href="{ulog}">PX4 ULog</a></p></section>''')
+        cards_by_algorithm.append(
+            f'<details class="terrain-task" open><summary>{algorithm.upper()} · 평지 초급/중급/고급 실제 PX4 HIL 3개</summary><div class="video-grid">{"".join(cards)}</div></details>'
+        )
+    status = "9/9 완료" if manifest.get("all_success") else "일부 실행 미완료"
+    return f'''<section class="section" id="px4-flat-hil-suite"><div class="section-kicker">FRESH RL TRAINING → REAL PX4 EKF2 HIL · 9 MP4</div><h2>PX4 평지 초급·중급·고급 — PPO·DDPG·SAC 재학습 배포 검증</h2><div class="callout"><strong>{status}.</strong> 세 정책은 동일 7D 카메라/자체수직속도 입력과 2D residual 출력을 MuJoCo에서 새로 학습한 뒤, 각 난이도에서 독립 PX4 SITL·EKF2·MAVLink HIL 프로세스로 실행했습니다. Go2는 별도의 학습된 12관절 저수준 PPO로 실제 발바닥 접지 보행하며, 영상 HUD와 표에서 실제 속도·이동거리·발바닥 접지 수를 확인할 수 있습니다. <strong>난이도 이동 설정:</strong> {route_summary}. 아래 MP4는 실제 PX4 모터 할당 경로의 배포 검증입니다.</div>{''.join(cards_by_algorithm)}<p class="links"><a href="px4_flat_hil_suite.json">전체 실행 manifest</a><a href="px4_flat_hil_training/px4_flat_hil_training_metrics.json">재학습 평가 JSON</a><a href="px4_flat_hil_onnx_models.json">ONNX 검증 manifest</a></p></section>'''
+
+
 def main() -> None:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     metrics = read_json(ARTIFACTS / "go2_back_qr_training_metrics.json")
@@ -269,6 +333,9 @@ def main() -> None:
     timesteps = html.escape(str(metrics.get("timesteps_per_algorithm", "—")))
     source = html.escape(str(metrics.get("go2_model_source", "unitreerobotics/unitree_mujoco")))
     cards = "".join(algorithm_card(name, metrics, onnx_models.get(name, {})) for name in ALGORITHMS)
+    px4_hil_html = px4_flat_hil_section()
+    px4_hil_suite_html = px4_flat_hil_suite_section()
+    flat_reels_html = flat_difficulty_reel_section()
     gravel_html = gravel_landing_section(read_json(ARTIFACTS / "go2_discrete_gravel_landing_suite.json"))
     loco_eval = loco.get("evaluation", {})
     loco_error = fmt(loco_eval.get("mean_terminal_velocity_error_mps"), 3, " m/s")
@@ -426,6 +493,8 @@ def main() -> None:
 <div class="eyebrow">OFFICIAL UNITREE GO2 · MUJOCO · ONNX RUNTIME</div><h1>Go2 등부 고정 QR 패드로의 X500 이동 착륙</h1><p class="lead">공식 Unitree Go2 MJCF·메시와 legged-loco 계약을 이식해 재학습한 MuJoCo 저수준 로코모션으로, 보행 경로 중인 Go2의 등에 QR 패드를 <strong>고정 연결</strong>하고 X500을 착륙시켰습니다. PPO·DDPG·SAC를 각각 {timesteps} step 학습했습니다.</p>
 <section class="section"><h2>모델·장착 구조</h2><div class="callout"><strong>최고 중급 정책: {best}</strong> · Go2 원본 모델: <a href="https://github.com/unitreerobotics/unitree_mujoco">unitreerobotics/unitree_mujoco</a> · {source}. legged-loco의 450D/12D 계약으로 Go2 PPO 후보도 재학습했지만, 새 10% 지형 통과 기준을 만족하지 않아 공개 지형 영상에는 쓰지 않았습니다. 대신 같은 Go2 IMU·자체 odometry만 쓰는 검증된 물리 기준 트로트를 사용합니다.</div><p><code>base_link child / freejoint 없음</code>으로 0.22 kg 등부 브래킷을 정확히 고정했습니다. <strong>QR 인쇄층은 23 cm, 실제 보이는 물리 판은 36 cm</strong>입니다. 착륙 물리는 QR 판 최상면에서 발생합니다. QR 잉크는 카메라의 coplanar z-fighting을 막기 위한 <strong>3 μm 시각 인쇄층</strong>만 그 위에 두며, 사람 눈·물리 스케일에서는 QR 바닥과 같은 면입니다. X500의 실제 착륙다리 바닥은 PX4 Gazebo 원본과 같은 연속 스키드 레일 2개의 <strong>보이는 MuJoCo 물체</strong>입니다. 각 레일은 <code>0.25 × 0.015 × 0.015 m</code>, body 기준 <code>x=0, y=±0.132 m</code>이며, 바닥면은 <code>z=-0.22759951 m</code>입니다. 이 두 물체가 QR 판에 직접 충돌합니다.</p><p>이전 영상의 다리 관통처럼 보인 현상은 수제 물리 접촉면이 stock X500 시각 스키드보다 101.6 mm 높았던 형상 불일치와, QR 잉크면 아래 0.4 mm에 있던 접촉판 때문이었습니다. 지금은 Gazebo 원본 레일 치수를 이식하고, 보이는 레일 바닥과 물리 QR 판 최상면을 직접 일치시켰습니다. 잉크의 3 μm 시각층은 렌더링 겹침만 피하며 접촉을 바꾸지 않습니다. 드론 옆 검은 상자는 센서가 아니라 종전 접촉 원통과 카메라 하우징·렌즈 렌더용 자리표시자였으므로 제거·숨겼고, 실제 하향 관측을 만드는 MuJoCo <code>down_camera</code>는 그대로 동작합니다. 프로펠러는 PX4 원본 SDF의 rotor-local 메시 오프셋을 반영해 각 모터 축 위에 정렬했습니다.</p></section>
 {input_guide_html}
+{px4_hil_html}
+{px4_hil_suite_html}
 <section class="section"><h2>legged-loco 기반 MuJoCo 저수준 로코모션</h2><div class="callout"><strong>소스:</strong> <a href="https://github.com/yang-zj1026/legged-loco">yang-zj1026/legged-loco</a> (commit 87b0d3d). 이 저장소에는 공개 Go2 체크포인트가 없으므로, Isaac Lab 전용 상태·행동 계약을 MuJoCo에 이식하고 실제 접지 미끄럼·몸통 높이·대각 접촉 위상을 보상에 넣어 PPO를 재학습했습니다.</div><div class="split"><div class="formula-card"><h3>IK 트로트·상태·행동·PD</h3><p>Go2 저수준 정책은 몸통 각속도·자세·속도명령·12개 관절 위치와 속도·직전 행동을 10프레임 쌓은 450개 값을 받습니다. 12개 관절 보정값을 출력하며, 기준 IK 트로트 관절각에 더한 뒤 PD 토크로 보행시킵니다. 이 Go2 입력은 드론 정책 7D와 완전히 별개입니다.</p><details><summary>Go2 상태·행동·PD 수식 펼쳐 보기</summary>{loco_formula}</details></div><div class="formula-card"><h3>독립 로코모션 평가</h3><p><code>평균 속도 오차</code> {loco_error}<br><code>평균 yaw-rate 오차</code> {loco_yaw_error}<br><code>접지 발 미끄럼</code> {loco_slip}<br><code>몸통 높이</code> {loco_height}<br><code>대각 접촉 일치율</code> {loco_match}<br><code>root wrench 최대 절댓값</code> {loco_root_wrench}<br><code>종단 base-up</code> {loco_up}<br><code>전도율</code> {loco_fall}<br><code>평균 경로 길이</code> {loco_path}</p><p>QR 데크의 0.22 kg 고정 하중을 학습·평가에 포함했습니다. Go2 root에는 외력을 넣지 않으며 보행은 관절 토크와 실제 발 접촉만으로 발생합니다. 기체는 5 ms MuJoCo 접촉을 사용하고, PPO는 20 ms마다 행동을 갱신합니다.</p></div></div></section>
 <section class="section"><h2>정책 출력·안전층·학습 보상</h2><div class="callout"><strong>X500에는 착륙다리 센서가 없습니다.</strong> 네 착륙다리는 물리 충돌 형상일 뿐이며 touch/load/contact 채널을 만들지 않았습니다. 모델 출력도 모터 PWM·추력·최종 속도 명령이 아니라, 기본 시각서보에 아주 작게 더할 수 있는 수평 보정 제안 두 개입니다.</div><div class="split"><div class="formula-card"><h3>ONNX 출력 2개는 실제로 무엇을 하나</h3><p><code>a_x, a_y ∈ [-1,1]</code>은 드론 body XY 방향의 무차원 residual 제안입니다. 제어기는 이를 현재 드론 자세로 world XY에 회전한 다음, 카메라가 측정한 QR 중심을 향하는 안쪽 성분만 남깁니다. QR에서 멀어지는 성분과 접선 성분은 버립니다.</p><p>held-out 평가·ONNX 영상에서 남은 값의 최대 영향은 <strong>0.001 m/s</strong>입니다. 상대높이 1.20 m 아래부터 선형으로 줄고 0.45 m 이내에서는 완전히 0이 됩니다. 실제 빠른 이동, 목표속도 feed-forward, 중심 복원, 단계별 하강과 자세 정렬은 정책 밖 결정론적 카메라/IMU 제어기가 담당하며 수평 목표속도는 3.6 m/s로 제한됩니다. 즉 RL 모델 하나가 착륙기 전체를 직접 조종하는 구조가 아닙니다.</p></div><div class="formula-card"><h3>보상은 학습 때 무엇을 가르치나</h3><ul class="plain-list"><li>이전 step보다 QR 정답 수평거리 <code>d_t</code>를 줄이면 진행 보상, 멀어지면 같은 항에서 손해를 줍니다.</li><li>남은 거리와 불필요하게 큰 raw residual 행동에는 매 step 패널티를 줍니다.</li><li>0.30 m 안에 들어오면 작은 정렬 보너스, 물리적으로 안정 착륙하면 +110, hard landing은 -55입니다.</li><li>Go2가 넘어지면 -80, 15 m 경계 또는 9 m 고도를 벗어나면 -25입니다.</li></ul><p><code>d_t</code>, 정확한 상대고도, 데크 상대속도와 MuJoCo 접촉은 <strong>privileged training/termination label</strong>입니다. 정책 관측이나 비행제어 입력이 아니며, 실기 ONNX 추론에서는 보상을 계산할 필요가 없습니다. 접촉 수·정상력·침투량을 읽는 dense reward 항도 없습니다.</p><details><summary>정확한 학습 보상 수식 펼쳐 보기</summary>{reward_formula}</details></div></div></section>
 <section class="section"><h2>현재 구현과 실기 대응 센서 감사표</h2><div class="table-scroll"><table><thead><tr><th>값</th><th>검증된 MuJoCo 경로</th><th>실기에서 연결할 센서/토픽</th><th>정책/제어 사용</th></tr></thead><tbody><tr><td><code>u_qr, v_qr, z_pnp, detected, R_CM^PnP</code></td><td>명목 30 Hz, 5 ms 격자에서 실제 약 28.57 Hz인 QR/PnP 이동·회전 측정 에뮬레이터</td><td>별도 장착·보정한 하향 RGB 카메라 + CameraInfo + QR corner detector + 23 cm known-size solvePnP</td><td>u/v/depth/detected는 7D 정책 입력 · 회전은 정책 밖 자세제어</td></tr><tr><td><code>du_qr/dt, dv_qr/dt</code></td><td>연속 검출 QR 중심의 timestamp 차분, ±5/s clip과 0.65/0.35 저역통과</td><td>프레임별 detector 중심 좌표와 캡처 timestamp</td><td>예 · 7D 정책 입력</td></tr><tr><td><code>v_z,est</code></td><td>명시적 GNSS 속도 채널에 잡음을 더한 정확히 50 Hz sample-and-hold PX4 출력 surrogate</td><td>PX4 <code>vehicle_local_position.vz</code>의 validity·timestamp 확인 및 NED 하향 양수 → 학습 world-up 부호 반전. 실제 EKF2/기압계는 이 MuJoCo 구현에서 실행하지 않음</td><td>예 · 7D 중 1개</td></tr><tr><td><code>p_est, v_est, R_imu, omega_imu</code></td><td>명시적 framepos·framelinvel·framequat·gyro에서 만든 50 Hz PX4 출력 surrogate</td><td>실기 GNSS/IMU와 PX4 local position·attitude 상태추정 출력 및 FRD/NED 좌표 변환</td><td>아니오 · 정책 밖 비행제어</td></tr><tr><td><code>f_B,z^imu, f_B,z^cmd</code></td><td>body-Z accelerometer와 시뮬레이터 제어기가 이미 알고 있는 collective-thrust 명령</td><td>IMU 가속도계 + 제어기가 자신이 보낸 추력. 단순 Offboard 속도 setpoint만 보내는 현재 ROS 경로에서는 같은 commanded-force 잔차를 바로 얻을 수 없음</td><td>아니오 · 충격/재시도 제어</td></tr><tr><td><code>offline_sim_*</code> Go2/base/pad·경로·착륙다리-판 물리 접촉</td><td>MuJoCo 학습 종단·종단 라벨·사후 평가 로거</td><td>실기 대응 센서 없음·비행제어에서 사용 안 함</td><td><strong>아니오</strong></td></tr></tbody></table></div><p>MuJoCo 장면의 QR 정답 기하를 읽는 코드는 카메라 센서 에뮬레이터 한 함수 안으로 격리했습니다. 이 함수는 렌더 RGB를 decode하는 대신 실기 QR detector/solvePnP가 낼 수 있는 값 형태로 투영·잡음·sample-and-hold를 적용합니다. 비행제어는 그 캐시와 드론 자체 추정 surrogate만 읽고 정확한 QR 월드 자세를 직접 복사하지 않습니다. <strong>착륙다리 touch/load/contact 센서는 존재하지 않으며 추가하지도 않았습니다.</strong> 실기 7D 어댑터는 앞으로 구현·비행 검증해야 합니다.</p></section>
@@ -433,6 +502,7 @@ def main() -> None:
 <section class="section"><h2>초급·중급·고급의 정의: Go2 속도와 방향전환 복잡도</h2><div class="split"><div class="formula-card"><h3>동일 조건, 경로만 난이도화</h3><p>세 난이도 모두 X500 시작점은 QR 중심에서 2–7 m 원환 영역, 고도 1.20–1.80 m이며 바람·검출 누락·착륙 판정도 같습니다. 달라지는 것은 Go2의 명목 전진속도와 선회 진폭·빈도뿐입니다. Go2는 경로 접선 방향으로 몸통 yaw를 돌리고 대각선 트로트로 이동합니다.</p><details><summary>Go2 경로 생성 수식 펼쳐 보기</summary>{route_formula}</details></div><div class="formula-card"><h3>실행 프로파일</h3><div class="table-scroll"><table><thead><tr><th>난이도</th><th>명목 전진</th><th>최대 선회각</th><th>전환 빈도</th></tr></thead><tbody>{difficulty_rows}</tbody></table></div><p>Go2는 각 난이도에 정의된 시간 함수 속도·선회 명령을 그대로 따르며, 드론의 정렬 또는 착륙 상태로 경로 속도를 바꾸지 않습니다.</p></div></div></section>
 <section class="section"><h2><code>offline_sim_*</code> X500 착륙다리 바닥 ↔ QR 판 물리 진단</h2><div class="callout"><strong>착륙다리 센서가 아닙니다.</strong> 아래 레일 접촉·정상력·침투량·데크 속도는 MuJoCo 학습 보상, 종단 판정, 사후 검증에만 쓰이고 7D 정책 관측에는 들어가지 않습니다.</div><div class="split"><div class="formula-card"><h3>무엇을 검사하나</h3><p>MuJoCo contact 목록에서 PX4 Gazebo 원본과 같은 좌·우 스키드 레일 물체와 QR 판 최상면 사이의 접촉만 골라, 닿은 레일 수·정상력 합·가장 깊은 수치 침투를 계산합니다. QR 잉크는 이 면보다 3 μm 위의 렌더 레이어라 하향 카메라에서 깜박이지 않으며 물리 접촉에는 쓰이지 않습니다. 이 값은 실제 X500에서 얻는 센서값이 아니며 영상 성공 여부와 물리 형상 비관통을 사후 확인하기 위한 것입니다.</p><details><summary>접촉 진단 수식 펼쳐 보기</summary>{contact_formula}</details></div><div class="formula-card"><h3>보정 기준</h3><p><code>보이는 물리 착륙 스키드 레일 2개</code>는 각각 길이 250 mm·폭 15 mm·높이 15 mm이고 body 기준 <code>x=0, y=±0.132 m</code>, 바닥면 <code>z=-0.22759951 m</code>입니다. 수입한 stock X500 렌더 스키드의 최저면과 36 cm 물리 QR 데크 최상면을 일치시켜, 사용자가 보는 다리 바닥 물체가 곧 접촉 물체가 되게 했습니다. QR 잉크 3 μm는 실제 인쇄 두께 수준의 시각 분리입니다. 성공은 양쪽 레일 모두 접촉, 상대높이 0.245 m 이하, 중심오차 5.5 cm, 데크 대비 상대속도 0.40 m/s 미만을 동시에 만족해야 합니다.</p><p>MuJoCo soft-contact의 수치 침투 gate는 2 mm이며, 보이는 충돌 레일과 보이는 QR 물리 판이 직접 맞닿으므로 수치 침투와 영상 형상이 서로 어긋나지 않습니다. 각 추론 CSV의 <code>offline_sim_visual_contact_plane_error_m</code>도 1 mm 이하인지 검사합니다. 표와 CSV에는 실제 최대값을 숨기지 않고 <code>offline_sim_*</code>로 기록합니다.</p></div></div></section>
 <section class="section"><h2>PPO · DDPG · SAC 학습방법과 하이퍼파라미터</h2><div class="callout">세 기법은 위에서 설명한 <strong>동일한 float32[7] 입력, 2D residual 출력, 환경 보상</strong>을 사용합니다. 차이는 경험을 모으고 actor/critic을 갱신하는 방식입니다.</div><div class="example-grid"><article><h3>PPO</h3><p>현재 정책으로 512 step rollout을 모은 뒤, advantage가 좋은 행동 확률은 올리고 나쁜 행동 확률은 내립니다. 한 번의 큰 업데이트로 정책이 무너지는 것을 막기 위해 이전 정책과의 확률비를 ±20% 범위로 clip하며 같은 rollout을 10 epoch 재사용합니다.</p><p><code>lr 2.5e-4 · batch 128 · γ 0.997 · GAE 0.96 · clip 0.20 · value coefficient 0.50</code></p></article><article><h3>DDPG</h3><p>결정론 actor가 한 행동을 critic이 평가합니다. 180,000개 replay buffer에서 과거 transition을 무작위로 뽑아 Q 오차를 줄이고, actor는 critic의 Q가 커지는 방향으로 갱신합니다. 처음 2,000 step은 buffer를 채우며, 학습 탐색에는 표준편차 0.18 행동 잡음을 사용합니다.</p><p><code>lr 3e-4 · batch 256 · γ 0.997 · target τ 0.01 · warm-up 2,000</code></p></article><article><h3>SAC</h3><p>두 Q critic 중 작은 값을 사용해 과대평가를 줄입니다. actor는 높은 Q뿐 아니라 행동 분포의 entropy도 유지하도록 학습해, DDPG보다 확률적인 탐색을 합니다. entropy 계수는 초기값 0.02에서 자동 조정됩니다.</p><p><code>lr 3e-4 · replay 180,000 · batch 256 · γ 0.997 · target τ 0.01 · warm-up 2,000</code></p></article><article><h3>공통 데이터 한 건</h3><p>각 transition은 <code>(현재 7D, 2D 행동, reward, 다음 7D, 종료 여부)</code>입니다. 보상과 종료 판정에는 MuJoCo 정답 라벨을 쓸 수 있지만, 저장된 actor가 받는 입력은 계속 7D뿐입니다. 평가와 영상에서는 학습 탐색 잡음을 끄고 결정론적으로 ONNX 출력을 사용합니다.</p></article></div><details><summary>PPO·DDPG·SAC 손실 수식 펼쳐 보기</summary>{loss_formula}</details><p>수식은 CDN이 아닌 이 서버의 로컬 MathJax로 렌더링됩니다.</p></section>
+{flat_reels_html}
 <section class="section"><h2>초급·중급·고급: 9개 동기화 영상과 평가</h2><p>각 MP4는 5 ms 물리 서브스텝에서 실제 30 fps로 캡처하며, 좌측 Go2·X500 3인칭과 우측 X500 하향 카메라를 같은 MuJoCo state에서 렌더링합니다. 자갈길 영상은 Go2 발이 닿는 실제 충돌면을 가까이 보는 3인칭 주 화면에, 전체 X500 3인칭 삽입 화면을 같은 시점으로 동기화합니다. 우측 하단뷰는 검정 레터박스 없이 640×720 전체 높이를 채웁니다. 넓은 3인칭의 X500은 매 프레임 현재 GL 카메라로 투영하고, 1 Hz MuJoCo segmentation 실루엣으로 실제 렌더 가시성과 크기를 반복 검증합니다. 프로펠러는 영상에서만 반대 방향으로 회전하며, Go2와 QR 장착부의 물리에는 영향을 주지 않습니다.</p>{cards}</section>
 {gravel_html}
 <footer>6개 핵심 평가지표: <code>mean_reward</code>, <code>std_reward</code>, <code>success_rate</code>, <code>mean_terminal_error_m</code>, <code>mean_episode_duration_s</code>, <code>mean_episode_steps</code>. 접촉·데크 속도·Go2 물리량은 정책 입력이 아닌 <code>offline_sim_*</code> 진단입니다. 모든 산출물은 MuJoCo에서 생성했습니다.</footer></main></body></html>'''
