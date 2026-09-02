@@ -13,6 +13,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = PROJECT_ROOT / "artifacts" / "rl_training"
 ALGORITHMS = ("ppo", "ddpg", "sac")
+PX4_ALGORITHMS = ("ppo", "ddpg", "sac", "mpc")
 DIFFICULTIES = (("easy", "초급"), ("medium", "중급"), ("hard", "고급"))
 INFERENCE_CSV_FIELDS = {
     "sim_time_s", "qr_error_m", "altitude_m", "detected",
@@ -277,9 +278,9 @@ def algorithm_card(name: str, metrics: dict, onnx: dict) -> str:
 
 def px4_flat_hil_section() -> str:
     """Explain the current PX4 HIL boundary without duplicating stale media."""
-    return '''<section class="section" id="px4-flat-hil"><div class="section-kicker">REAL PX4 SITL · EKF2 · MAVLINK HIL · FLAT ONLY</div><div class="algorithm-heading"><div><h2>분리 실행 PX4 EKF2 평지 착륙</h2><p>아래 9개 영상은 각각 독립 PX4 SITL 프로세스에서 재생성한 최신 결과입니다. MuJoCo는 센서·기체 물리·Go2/QR 접촉을 맡고, PX4는 실제 EKF2·멀티콥터 위치 제어·모터 할당을 수행합니다.</p></div><b class="ok">9/9 완료 · 실제 PX4 EKF2 HIL</b></div>
-<div class="split"><div class="formula-card"><h3>실제로 PX4에 들어간 값</h3><p>매 5 ms MuJoCo IMU(가속도·자이로·자력계), 기압, GPS 위치·속도를 <code>HIL_SENSOR</code>/<code>HIL_GPS</code>로 보냅니다. PX4 EKF2의 local position·velocity·attitude를 다시 받아 카메라 기반 임무의 드론 자체 상태로만 사용합니다. GPS/상태/명령 좌표는 MuJoCo NWU와 PX4 NED/FRD 사이에서 변환합니다.</p><p>각 PPO·DDPG·SAC ONNX는 QR/PnP 6개와 PX4 수직속도 1개의 <code>float32[7]</code>만 받고, 2D 제한 residual을 냅니다. Go2 위치·속도, QR 월드 정답, 접촉값은 정책 입력이나 PX4 명령에 넣지 않습니다.</p></div><div class="formula-card"><h3>PX4가 실제로 한 일</h3><p>Offboard local-velocity setpoint를 수신한 PX4 multicopter 위치제어기가 자세·collective를 계산하고, 반환된 <code>HIL_ACTUATOR_CONTROLS</code> 네 값만 X500의 MuJoCo 추력/토크로 변환합니다. 직접 비행 wrench, 직접 pose/velocity 이동, 외부 모터 명령은 사용하지 않습니다.</p><p>최신 각 실행의 EKF innovation, HIL 메시지 수, trace CSV와 ULog는 아래 9개 카드에서 각각 확인할 수 있습니다.</p></div></div>
-<p class="offline-note"><strong>범위:</strong> 실제 비행 하드웨어가 아니라, 기존 Gazebo를 실행하지 않는 격리된 <strong>PX4 SITL + MuJoCo HIL</strong> 평지 검증입니다. 실제 EKF2·PX4 모터 제어 경로는 검증했지만 카메라 RGB decoder/solvePnP 하드웨어 어댑터는 아직 연결하지 않았습니다.</p><p class="links"><a href="#px4-flat-hil-suite">최신 9개 PX4 HIL MP4와 지표로 이동</a></p></section>'''
+    return '''<section class="section" id="px4-flat-hil"><div class="section-kicker">REAL PX4 SITL · EKF2 · MAVLINK HIL · FLAT ONLY</div><div class="algorithm-heading"><div><h2>분리 실행 PX4 EKF2 평지 착륙</h2><p>아래 12개 영상은 각각 독립 PX4 SITL 프로세스에서 재생성한 최신 결과입니다. MuJoCo는 센서·기체 물리·Go2/QR 접촉을 맡고, PX4는 실제 EKF2·멀티콥터 위치 제어·모터 할당을 수행합니다.</p></div><b class="ok">12/12 완료 · 실제 PX4 EKF2 HIL</b></div>
+<div class="split"><div class="formula-card"><h3>실제로 PX4에 들어간 값</h3><p>매 5 ms MuJoCo IMU(가속도·자이로·자력계), 기압, GPS 위치·속도를 <code>HIL_SENSOR</code>/<code>HIL_GPS</code>로 보냅니다. PX4 EKF2의 local position·velocity·attitude를 다시 받아 카메라 기반 임무의 드론 자체 상태로만 사용합니다. GPS/상태/명령 좌표는 MuJoCo NWU와 PX4 NED/FRD 사이에서 변환합니다.</p><p>PPO·DDPG·SAC ONNX는 QR/PnP 6개와 PX4 수직속도 1개의 <code>float32[7]</code>만 받고 2D 제한 residual을 냅니다. <strong>MPC는 ONNX 없이</strong> 카메라/PnP 상대 위치·상대 속도와 PX4 EKF 수평속도로 8-step 수평 속도 계획을 매 제어 주기 다시 풉니다. 네 방법 모두 Go2 위치·속도, QR 월드 정답, 접촉값을 제어 입력으로 넣지 않습니다.</p></div><div class="formula-card"><h3>PX4가 실제로 한 일</h3><p>Offboard local-velocity setpoint를 수신한 PX4 multicopter 위치제어기가 자세·collective를 계산하고, 반환된 <code>HIL_ACTUATOR_CONTROLS</code> 네 값만 X500의 MuJoCo 추력/토크로 변환합니다. 직접 비행 wrench, 직접 pose/velocity 이동, 외부 모터 명령은 사용하지 않습니다.</p><p>최신 각 실행의 EKF innovation, HIL 메시지 수, trace CSV와 ULog는 아래 12개 카드에서 각각 확인할 수 있습니다.</p></div></div>
+<p class="offline-note"><strong>범위:</strong> 실제 비행 하드웨어가 아니라, 기존 Gazebo를 실행하지 않는 격리된 <strong>PX4 SITL + MuJoCo HIL</strong> 평지 검증입니다. 실제 EKF2·PX4 모터 제어 경로는 검증했지만 카메라 RGB decoder/solvePnP 하드웨어 어댑터는 아직 연결하지 않았습니다.</p><p class="links"><a href="#px4-flat-hil-suite">최신 12개 PX4 HIL MP4와 지표로 이동</a></p></section>'''
 
 
 def px4_flat_hil_suite_section() -> str:
@@ -288,7 +289,7 @@ def px4_flat_hil_suite_section() -> str:
     manifest = read_json(manifest_file)
     records = [item for item in manifest.get("records", []) if isinstance(item, dict)]
     if not records:
-        return '''<section class="section" id="px4-flat-hil-suite"><div class="section-kicker">PX4 FLAT STAGE SUITE · PPO/DDPG/SAC</div><h2>PX4 평지 초급·중급·고급 재학습 검증</h2><div class="callout">PPO·DDPG·SAC 재학습 및 실제 PX4 EKF2 HIL 9개 재생을 준비 중입니다.</div></section>'''
+        return '''<section class="section" id="px4-flat-hil-suite"><div class="section-kicker">PX4 FLAT STAGE SUITE · PPO/DDPG/SAC/MPC</div><h2>PX4 평지 초급·중급·고급 배포 검증</h2><div class="callout">PPO·DDPG·SAC 재학습 정책과 카메라/PnP MPC의 실제 PX4 EKF2 HIL 12개 재생을 준비 중입니다.</div></section>'''
     route_summaries: list[str] = []
     for difficulty, korean in DIFFICULTIES:
         representative = next((item for item in records if item.get("algorithm") == "ppo" and item.get("difficulty") == difficulty), {})
@@ -300,7 +301,7 @@ def px4_flat_hil_suite_section() -> str:
         )
     route_summary = html.escape(" · ".join(route_summaries))
     cards_by_algorithm: list[str] = []
-    for algorithm in ALGORITHMS:
+    for algorithm in PX4_ALGORITHMS:
         cards: list[str] = []
         for difficulty, korean in DIFFICULTIES:
             record = next((item for item in records if item.get("algorithm") == algorithm and item.get("difficulty") == difficulty), {})
@@ -321,7 +322,7 @@ def px4_flat_hil_suite_section() -> str:
             f'<details class="terrain-task" open><summary>{algorithm.upper()} · 평지 초급/중급/고급 실제 PX4 HIL 3개</summary><div class="video-grid">{"".join(cards)}</div></details>'
         )
     reel_cards: list[str] = []
-    for algorithm in ALGORITHMS:
+    for algorithm in PX4_ALGORITHMS:
         reel = f"px4_sitl_ekf2_{algorithm}_flat_easy_medium_hard_reel.mp4"
         available = (ARTIFACTS / reel).is_file()
         reel_cards.append(
@@ -330,11 +331,13 @@ def px4_flat_hil_suite_section() -> str:
 <p>각 단계 시작 보드에 <strong>PX4 SITL·EKF2·MAVLink HIL</strong>, QR/PnP 기반 Offboard <code>vx/vy/vz</code>, PX4 위치·자세 제어와 네 모터 할당을 명시했습니다. 이후에는 같은 실행의 3인칭과 하향 QR 카메라 동기화 화면을 재생합니다.</p><p class="links"><a href="{reel}">PX4 HIL 합본 MP4</a></p></section>'''
         )
     reel_section = (
-        '<details class="terrain-task" open><summary>PX4 SITL HIL · 초급/중급/고급 단계별 합본 3개</summary>'
+        '<details class="terrain-task" open><summary>PX4 SITL HIL · 초급/중급/고급 단계별 합본 4개</summary>'
         '<div class="video-grid">' + "".join(reel_cards) + "</div></details>"
     )
-    status = "9/9 완료" if manifest.get("all_success") else "일부 실행 미완료"
-    return f'''<section class="section" id="px4-flat-hil-suite"><div class="section-kicker">FRESH RL TRAINING → REAL PX4 EKF2 HIL · 9 MP4</div><h2>PX4 평지 초급·중급·고급 — PPO·DDPG·SAC 재학습 배포 검증</h2><div class="callout"><strong>{status}.</strong> 세 정책은 동일 7D 카메라/자체수직속도 입력과 2D residual 출력을 MuJoCo에서 새로 학습한 뒤, 각 난이도에서 독립 PX4 SITL·EKF2·MAVLink HIL 프로세스로 실행했습니다. Go2는 별도의 학습된 12관절 저수준 PPO로 실제 발바닥 접지 보행하며, 영상 HUD와 표에서 실제 속도·이동거리·발바닥 접지 수를 확인할 수 있습니다. <strong>난이도 이동 설정:</strong> {route_summary}. 아래 MP4는 실제 PX4 모터 할당 경로의 배포 검증입니다.</div>{''.join(cards_by_algorithm)}{reel_section}<p class="links"><a href="px4_flat_hil_suite.json">전체 실행 manifest</a><a href="px4_flat_hil_training/px4_flat_hil_training_metrics.json">재학습 평가 JSON</a><a href="px4_flat_hil_onnx_models.json">ONNX 검증 manifest</a></p></section>'''
+    successful = sum(1 for record in records if bool(record.get("success")))
+    expected = len(PX4_ALGORITHMS) * len(DIFFICULTIES)
+    status = f"{successful}/{expected} 완료" if successful == expected else f"{successful}/{expected} 완료 · 일부 실행 대기"
+    return f'''<section class="section" id="px4-flat-hil-suite"><div class="section-kicker">RL + CAMERA MPC → REAL PX4 EKF2 HIL · {expected} MP4</div><h2>PX4 평지 초급·중급·고급 — PPO·DDPG·SAC·MPC 배포 검증</h2><div class="callout"><strong>{status}.</strong> PPO·DDPG·SAC는 동일 7D 카메라/자체수직속도 입력과 2D residual 출력을 MuJoCo에서 학습한 정책입니다. <strong>MPC는 학습 모델이 아닌</strong> 카메라/PnP 상대위치·상대속도와 PX4 EKF 드론속도를 사용해 8-step 예측 비용을 최소화하는 비학습 baseline입니다. 네 기법 모두 각 난이도에서 독립 PX4 SITL·EKF2·MAVLink HIL 프로세스로 실행했습니다. Go2는 별도의 학습된 12관절 저수준 PPO로 실제 발바닥 접지 보행하며, 영상 HUD와 표에서 실제 속도·이동거리·발바닥 접지 수를 확인할 수 있습니다. <strong>난이도 이동 설정:</strong> {route_summary}. 아래 MP4는 실제 PX4 모터 할당 경로의 배포 검증입니다.</div>{''.join(cards_by_algorithm)}{reel_section}<p class="links"><a href="px4_flat_hil_suite.json">전체 실행 manifest</a><a href="px4_flat_hil_training/px4_flat_hil_training_metrics.json">RL 재학습 평가 JSON</a><a href="px4_flat_hil_onnx_models.json">RL ONNX 검증 manifest</a></p></section>'''
 
 
 def main() -> None:

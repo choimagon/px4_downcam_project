@@ -66,13 +66,18 @@ def title_text(
         "X500 시작: QR 중심에서 반경 2.01–6.90 m · 고도 1.20–1.80 m",
     )
     if px4_hil:
+        controller_line = (
+            "MPC는 카메라/PnP·PX4 EKF 속도로 8-step 수평 속도 비용을 최소화하며, 모터 PWM·직접 force는 쓰지 않음"
+            if algorithm == "mpc"
+            else "학습 정책은 수평 미세 보정만 제안하며, 모터 PWM·직접 force는 정책이 쓰지 않음"
+        )
         return "\n".join(
             common
             + (
                 "PX4 SITL + MuJoCo MAVLink HIL 검증",
                 "MuJoCo IMU·기압·GPS → PX4 EKF2 / QR·PnP → PX4 Offboard vx·vy·vz",
                 "PX4 위치·자세 제어와 모터 할당 → HIL_ACTUATOR_CONTROLS 4개 → MuJoCo 기체 물리",
-                "정책은 수평 미세 보정만 제안하며, 모터 PWM·직접 force는 정책이 쓰지 않음",
+                controller_line,
                 "이후 영상: PX4 모터 출력으로 비행한 3인칭 + 하향 QR 카메라 동기화 화면",
             )
         )
@@ -150,7 +155,7 @@ def build_reel(algorithm: str, *, font: Path, px4_hil: bool) -> Path:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--algorithms", nargs="+", choices=("ppo", "ddpg", "sac"),
+        "--algorithms", nargs="+", choices=("ppo", "ddpg", "sac", "mpc"),
         default=("ppo", "ddpg", "sac"), help="Policies to build (default: all three).",
     )
     parser.add_argument(

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the nine flat PPO/DDPG/SAC PX4 EKF2 HIL landing evaluations.
+"""Run flat PPO/DDPG/SAC and camera-MPC PX4 EKF2 HIL landing evaluations.
 
 Each replay starts a fresh, isolated PX4 SITL rootfs through the generic HIL
 runner.  The generated manifest intentionally separates MuJoCo training from
@@ -20,7 +20,7 @@ from typing import Any
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 ARTIFACTS = PROJECT_ROOT / "artifacts" / "rl_training"
-ALGORITHMS = ("ppo", "ddpg", "sac")
+ALGORITHMS = ("ppo", "ddpg", "sac", "mpc")
 DIFFICULTIES = ("easy", "medium", "hard")
 # The fixed seed changes only the deterministic physical/camera realization;
 # difficulty remains entirely controlled by the named Go2 profile.
@@ -41,7 +41,7 @@ def parse_args() -> argparse.Namespace:
         "--onnx-dir",
         type=Path,
         default=ARTIFACTS / "px4_flat_hil_onnx",
-        help="Directory containing {ppo,ddpg,sac}_px4_flat_hil.onnx.",
+        help="Directory containing learned {ppo,ddpg,sac}_px4_flat_hil.onnx models.",
     )
     parser.add_argument(
         "--training-metrics",
@@ -196,9 +196,11 @@ def main() -> None:
     locomotion_minimums = {"easy": (0.60, 0.40), "medium": (0.75, 0.55), "hard": (0.90, 0.70)}
     records: list[dict[str, object]] = []
     for algorithm in ALGORITHMS:
-        onnx = args.onnx_dir / f"{algorithm}_px4_flat_hil.onnx"
-        if not onnx.is_file():
-            raise SystemExit(f"Missing {algorithm.upper()} ONNX: {onnx}")
+        onnx: Path | None = None
+        if algorithm != "mpc":
+            onnx = args.onnx_dir / f"{algorithm}_px4_flat_hil.onnx"
+            if not onnx.is_file():
+                raise SystemExit(f"Missing {algorithm.upper()} ONNX: {onnx}")
         for difficulty in DIFFICULTIES:
             motion_delay_s = motion_delay_by_difficulty[difficulty]
             speed_scale = speed_scale_by_difficulty[difficulty]
@@ -217,7 +219,6 @@ def main() -> None:
                 sys.executable,
                 str(runner),
                 "--algorithm", algorithm,
-                "--onnx-model", str(onnx),
                 "--difficulty", difficulty,
                 "--seed", str(SEEDS[difficulty]),
                 "--locomotion-model", str(args.locomotion_model),
@@ -235,6 +236,8 @@ def main() -> None:
                 "--trace-file", str(output["trace"]),
                 "--px4-log-file", str(output["px4_log"]),
             ]
+            if onnx is not None:
+                command.extend(("--onnx-model", str(onnx)))
             metric: dict[str, object] = {}
             returncode: int | None = None
             if args.reuse_valid and output["metrics"].is_file():
@@ -268,8 +271,14 @@ def main() -> None:
                 "algorithm": algorithm,
                 "difficulty": difficulty,
                 "seed": SEEDS[difficulty],
-                "onnx": str(onnx.resolve().relative_to(PROJECT_ROOT)),
-                "onnx_sha256": sha256_file(onnx),
+                # MPC is intentionally a deterministic camera/PnP + EKF
+                # baseline, so it has no learned ONNX artefact.
+                "onnx": (
+                    str(onnx.resolve().relative_to(PROJECT_ROOT))
+                    if onnx is not None
+                    else None
+                ),
+                "onnx_sha256": sha256_file(onnx) if onnx is not None else None,
                 "video": output["video"].name,
                 "snapshot": output["snapshot"].name,
                 "metrics": output["metrics"].name,

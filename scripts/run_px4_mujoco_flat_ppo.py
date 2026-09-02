@@ -6,7 +6,7 @@ The X500's MuJoCo IMU, barometer and GPS are sent to PX4's
 camera-only companion mission, and PX4's HIL actuator outputs are the *only*
 motor commands converted to an X500 body wrench.  PPO, DDPG, or SAC can be
 evaluated as the same bounded QR-camera residual policy used by the existing
-flat comparison.
+flat comparison, alongside a non-learning camera/PnP velocity MPC baseline.
 
 This runner intentionally supports flat terrain only.  It does not alter a
 PX4 checkout or a user's Gazebo process: ``Px4MujocoHilSession`` creates an
@@ -54,16 +54,17 @@ from landing_rl.px4_mujoco_hil import (
     px4_local_ned_to_world_enu,
     rpy_ned_to_world_from_body_flu,
 )
+from landing_rl.px4_visual_mpc import CameraVelocityMpc, VisualMpcConfig
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--algorithm", choices=("ppo", "ddpg", "sac"), default="ppo")
+    parser.add_argument("--algorithm", choices=("ppo", "ddpg", "sac", "mpc"), default="ppo")
     parser.add_argument(
         "--onnx-model",
         type=Path,
         default=None,
-        help="Policy ONNX; defaults to the canonical artifact for --algorithm.",
+        help="Policy ONNX; required for PPO/DDPG/SAC and unused for the camera/PnP MPC baseline.",
     )
     parser.add_argument("--difficulty", choices=("easy", "medium", "hard"), default="easy")
     parser.add_argument(
@@ -165,7 +166,7 @@ def render_dual_view(
     third = _draw_lines(
         third,
         (
-            f"PX4 SITL EKF2 + MAVLink HIL | MuJoCo flat | {algorithm.upper()} QR residual",
+            f"PX4 SITL EKF2 + MAVLink HIL | MuJoCo flat | {algorithm.upper()} {'camera MPC' if algorithm == 'mpc' else 'QR residual'}",
             f"t={environment.data.time:05.1f}s  QR error={error:.3f}m  rel altitude={altitude:.2f}m",
             f"PX4: {'ARMED' if mission.session.armed else 'DISARMED'} | OFFBOARD={'ON' if mission.session.offboard_active else 'OFF'} | motor={motor_mean:.2f}",
             f"EKF2 innovation: XY={mission.horizontal_innovation_ratio:.4f}  Z={mission.vertical_innovation_ratio:.4f}",
@@ -185,7 +186,11 @@ def render_dual_view(
             f"ATTACHED DOWN CAMERA | {'QR DETECTED' if environment._qr_detected else 'SEARCHING'}",
             f"QR error={error:.3f}m | depth={environment._qr_depth if environment._qr_detected else 0.0:.2f}m",
             f"PX4 EKF2 vertical speed={environment._onboard_velocity()[2]:+.2f}m/s",
-            f"{algorithm.upper()} input: QR centre/depth/rate + PX4 vertical velocity",
+            (
+                "MPC: camera/PnP relative pose·velocity + PX4 EKF velocity"
+                if algorithm == "mpc"
+                else f"{algorithm.upper()} input: QR centre/depth/rate + PX4 vertical velocity"
+            ),
         ),
         origin=(18, 30),
         scale=0.41,
@@ -198,7 +203,7 @@ def render_dual_view(
 
 
 class Px4VisionMission:
-    """Camera/RL companion command producer with PX4-only motor authority."""
+    """Camera/RL/MPC companion command producer with PX4-only motor authority."""
 
     def __init__(
         self,
@@ -208,12 +213,18 @@ class Px4VisionMission:
         start_world_enu_m: np.ndarray,
         hil_time_base_us: int,
         flight_policy_residual_gain: float,
+        algorithm: str,
     ) -> None:
         self.environment = environment
         self.session = session
         self.start_world_enu_m = np.asarray(start_world_enu_m, dtype=np.float64).copy()
         self.hil_time_base_us = int(hil_time_base_us)
+        self.algorithm = str(algorithm)
         self.flight_policy_residual_gain = float(flight_policy_residual_gain)
+        self._camera_mpc = (
+            CameraVelocityMpc(VisualMpcConfig())
+            if self.algorithm == "mpc" else None
+        )
         self.last_motor_outputs = np.zeros(4, dtype=np.float64)
         self.landing_committed = False
         self._alignment_streak = 0
@@ -312,22 +323,40 @@ class Px4VisionMission:
             # 1.0x feed-forward with a stronger centring term keeps the rail
             # contact point over the physical QR board.  Every term here is
             # camera/PnP or the bounded policy residual, never Go2 state.
-            lateral_gain = 3.10 if relative_height < 0.50 else 1.35
-            velocity_lead = 1.12 if relative_height < 0.60 else 1.0
-            # Camera/PnP supplies both the target position and its filtered
-            # relative velocity.  Add a bounded D term at stock-skid height
-            # so the PX4 velocity loop matches the moving QR deck instead of
-            # crossing its centre at residual speed.  It is entirely a drone
-            # perception/EKF control term; Go2 state and Go2 control are not
-            # read or modified here.
-            relative_velocity_xy = np.clip(env._qr_relative_velocity_world[:2], -0.90, 0.90)
-            velocity_damping = 0.65 if relative_height < 0.50 else 0.0
-            desired_xy = (
-                velocity_lead * target_velocity[:2]
-                + lateral_gain * relative_world[:2]
-                + velocity_damping * relative_velocity_xy
-                + self.flight_policy_residual_gain * policy_world
+            use_mpc_approach = (
+                self._camera_mpc is not None and relative_height > 0.55
             )
+            if use_mpc_approach:
+                # The MPC has no learned-policy residual.  Above the final
+                # approach envelope it repeatedly solves a camera/PnP +
+                # PX4-EKF velocity tracking problem and returns only the
+                # next local horizontal velocity reference.
+                desired_xy = self._camera_mpc.command(
+                    target_minus_vehicle_xy_m=relative_world[:2],
+                    target_velocity_xy_mps=target_velocity[:2],
+                    vehicle_velocity_xy_mps=own_velocity[:2],
+                )
+            else:
+                # All methods, including MPC, use the same camera-only
+                # precision-landing safety layer below 0.55 m.  It avoids
+                # allowing a short PnP dropout to turn a good moving-deck
+                # track into a single-skid edge contact.
+                lateral_gain = 3.10 if relative_height < 0.50 else 1.35
+                velocity_lead = 1.12 if relative_height < 0.60 else 1.0
+                # Camera/PnP supplies both the target position and its filtered
+                # relative velocity.  Add a bounded D term at stock-skid height
+                # so the PX4 velocity loop matches the moving QR deck instead of
+                # crossing its centre at residual speed.  It is entirely a drone
+                # perception/EKF control term; Go2 state and Go2 control are not
+                # read or modified here.
+                relative_velocity_xy = np.clip(env._qr_relative_velocity_world[:2], -0.90, 0.90)
+                velocity_damping = 0.65 if relative_height < 0.50 else 0.0
+                desired_xy = (
+                    velocity_lead * target_velocity[:2]
+                    + lateral_gain * relative_world[:2]
+                    + velocity_damping * relative_velocity_xy
+                    + self.flight_policy_residual_gain * policy_world
+                )
             relative_speed = float(np.linalg.norm(env._qr_relative_velocity_world[:2]))
             # PnP frame-to-frame velocity is deliberately noisy at the
             # 30-Hz camera boundary.  Using it as a hard descent gate kept a
@@ -362,11 +391,16 @@ class Px4VisionMission:
             # still only an approach permission: physical touchdown remains
             # independently scored with both skids, <=55 mm QR error and the
             # measured relative-speed/contact thresholds.
+            # The MPC is a velocity-planning baseline, so it must prove a
+            # tighter measured deck-relative speed before it starts the final
+            # drop.  PPO/DDPG/SAC retain their already-validated 0.65 m/s
+            # PnP speed gate.
+            precision_speed_limit = 0.55 if self._camera_mpc is not None else 0.65
             if update_alignment:
                 if (
                     detected
                     and horizontal_error <= 0.060
-                    and relative_speed <= 0.65
+                    and relative_speed <= precision_speed_limit
                 ):
                     self._precision_streak += 1
                 else:
@@ -426,6 +460,8 @@ class Px4VisionMission:
                 # a flight-height command.
                 desired_z = 0.0
         else:
+            if self._camera_mpc is not None:
+                self._camera_mpc.reset()
             desired_xy = env._search_velocity(own_position)
             desired_z = float(np.clip(1.0 * (env._search_altitude - own_position[2]), -0.30, 0.30))
             self._alignment_streak = 0
@@ -566,10 +602,14 @@ def warm_and_arm_px4(
 
 def main() -> None:
     args = parse_args()
-    if args.onnx_model is None:
-        args.onnx_model = Path(f"artifacts/rl_training/onnx_go2/{args.algorithm}_go2_back_qr.onnx")
-    if not args.onnx_model.is_file():
-        raise SystemExit(f"Missing {args.algorithm.upper()} ONNX model: {args.onnx_model}")
+    if args.algorithm == "mpc":
+        if args.onnx_model is not None:
+            raise SystemExit("--onnx-model is not valid with --algorithm mpc")
+    else:
+        if args.onnx_model is None:
+            args.onnx_model = Path(f"artifacts/rl_training/onnx_go2/{args.algorithm}_go2_back_qr.onnx")
+        if not args.onnx_model.is_file():
+            raise SystemExit(f"Missing {args.algorithm.upper()} ONNX model: {args.onnx_model}")
     if args.max_steps <= 0:
         raise SystemExit("--max-steps must be positive")
     if not args.locomotion_model.is_file():
@@ -591,9 +631,14 @@ def main() -> None:
     for path in (args.video_file, args.snapshot_file, args.metrics_file, args.trace_file, args.px4_log_file):
         path.parent.mkdir(parents=True, exist_ok=True)
 
-    policy = ort.InferenceSession(str(args.onnx_model), providers=["CPUExecutionProvider"])
-    policy_input = policy.get_inputs()[0].name
-    policy_output = policy.get_outputs()[0].name
+    policy: ort.InferenceSession | None = None
+    policy_input = ""
+    policy_output = ""
+    if args.algorithm != "mpc":
+        assert args.onnx_model is not None
+        policy = ort.InferenceSession(str(args.onnx_model), providers=["CPUExecutionProvider"])
+        policy_input = policy.get_inputs()[0].name
+        policy_output = policy.get_outputs()[0].name
     environment = Go2BackQrLandingEnv(
         difficulty=args.difficulty,
         terrain_task="flat",
@@ -678,7 +723,10 @@ def main() -> None:
             session,
             start_world_enu_m=start_world_enu_m,
             hil_time_base_us=hil_time_base_us,
-            flight_policy_residual_gain=float(args.flight_policy_residual_gain),
+            flight_policy_residual_gain=(
+                0.0 if args.algorithm == "mpc" else float(args.flight_policy_residual_gain)
+            ),
+            algorithm=args.algorithm,
         )
         mission.update_ekf_estimate(force=True)
         environment._update_onboard_estimator = MethodType(
@@ -710,10 +758,13 @@ def main() -> None:
                 )
             )
             for _ in range(min(args.max_steps, environment.max_steps)):
-                action = policy.run(
-                    [policy_output], {policy_input: observation[np.newaxis, :].astype(np.float32)}
-                )[0][0]
-                action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+                if policy is None:
+                    action = np.zeros(2, dtype=np.float32)
+                else:
+                    action = policy.run(
+                        [policy_output], {policy_input: observation[np.newaxis, :].astype(np.float32)}
+                    )[0][0]
+                    action = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
                 observation, _reward, terminated, truncated, info = environment.step(action)
                 terminal_info = info
                 while environment.data.time + 1.0e-9 >= next_frame_time:
@@ -763,13 +814,33 @@ def main() -> None:
         metrics = {
             "backend": "mujoco_flat_x500_with_external_px4_sitl_ekf2_hil",
             "terrain": "flat",
-            "algorithm": f"{args.algorithm.upper()} ONNX residual policy",
+            "algorithm": (
+                "camera_pnp_receding_horizon_mpc"
+                if args.algorithm == "mpc" else f"{args.algorithm.upper()} ONNX residual policy"
+            ),
             "seed": args.seed,
             "difficulty": args.difficulty,
-            "flight_policy": {
-                "onnx_residual_gain_mps": float(args.flight_policy_residual_gain),
-                "role": "bounded horizontal trim; camera/PnP visual servo remains primary",
-            },
+            "flight_policy": (
+                {
+                    "type": "camera_pnp_receding_horizon_mpc",
+                    "inputs": "camera/PnP target translation and velocity; PX4 EKF vehicle velocity",
+                    "output": "PX4 local horizontal velocity reference (vx, vy)",
+                    "horizon_steps": 8,
+                    "prediction_dt_s": 0.10,
+                    "velocity_response_time_constant_s": 0.38,
+                    "position_weight": 8.0,
+                    "relative_velocity_weight": 7.0,
+                    "command_change_weight": 0.04,
+                    "terminal_position_weight": 20.0,
+                    "candidate_lattice": "9 x 9",
+                    "maximum_speed_mps": 3.60,
+                    "role": "non-learning camera/PnP MPC above 0.55 m; common camera-only precision-landing safety layer below 0.55 m; PX4 owns attitude, collective and motor allocation",
+                }
+                if args.algorithm == "mpc" else {
+                    "onnx_residual_gain_mps": float(args.flight_policy_residual_gain),
+                    "role": "bounded horizontal trim; camera/PnP visual servo remains primary",
+                }
+            ),
             "go2_route": {
                 "speed_scale": float(args.go2_speed_scale),
                 "turn_scale": float(args.go2_turn_scale),
